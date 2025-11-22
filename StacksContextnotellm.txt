@@ -1,0 +1,3431 @@
+# multi send
+
+Multi send is a very simple but highly useful utility contract for executing multiple STX transfers in a single transaction.
+
+It takes in a list of addresses and amounts and folds through them to execute a STX transfer for each one.
+
+Mainnet contract: <https://explorer.hiro.so/txid/0x59665b756dc0fa9efb3fca9e05a28f572c9b14ca894c115fd3e7d81a563e14f8?chain=mainnet>
+
+{% code title="multi-send.clar" %}
+
+```clojure
+;; send-many
+(define-private (send-stx (recipient { to: principal, ustx: uint }))
+  (stx-transfer? (get ustx recipient) tx-sender (get to recipient)))
+(define-private (check-err (result (response bool uint))
+                           (prior (response bool uint)))
+  (match prior ok-value result
+               err-value (err err-value)))
+(define-public (send-many (recipients (list 200 { to: principal, ustx: uint })))
+  (fold check-err
+    (map send-stx recipients)
+    (ok true)))
+```
+
+{% endcode %}
+
+
+
+-----------------------------------------------
+
+# audited starter contracts
+
+Here's a list of sample contracts to learn Clarity or to serve as a starting point for your next project. All contracts come from the [Clarity book](https://book.clarity-lang.org/) and have been audited by [Coinfabrik](https://www.coinfabrik.com/).
+
+* [Counter](https://github.com/clarity-lang/book/tree/main/projects/counter)
+* [Multisig Vault](https://github.com/clarity-lang/book/tree/main/projects/multisig-vault)
+* [Sip-009 NFT](https://github.com/clarity-lang/book/tree/main/projects/sip009-nft)
+* [SIP-010 FT](https://github.com/clarity-lang/book/tree/main/projects/sip010-ft)
+* [Timelocked Wallet](https://github.com/clarity-lang/book/tree/main/projects/timelocked-wallet)
+* [Tiny Market (NFT marketplace)](https://github.com/clarity-lang/book/tree/main/projects/tiny-market)
+
+
+------------------------------------------------------------------
+
+# stacking
+
+Stacking is implemented as a smart contract using Clarity. You can always find the Stacking contract identifier using the Stacks Blockchain API [`v2/pox` endpoint](https://docs.hiro.so/api#operation/get_pox_info).
+
+Currently, stacking uses the pox-4 contract. The deployed pox-4 contract and included comments can be [viewed in the explorer](https://explorer.hiro.so/txid/SP000000000000000000002Q6VF78.pox-4?chain=mainnet).
+
+In this walkthrough, we'll cover the entire stacking contract from start to finish, including descriptions of the various functions and errors, and when you might use/encounter them.
+
+Rather than walking through the contract line by line, which you can do by simply reading the contract code and the comments, we'll instead explore it from the perspective of conducting stacking operations, including solo stacking, delegating, and running a pool.
+
+At the bottom you will find a list of some errors you may run into and their explanations.
+
+There are a few utilities that make interacting with this contract easier including [Leather Earn](https://earn.leather.io/) as an UI and the [@stacks/stacking package](https://www.npmjs.com/package/@stacks/stacking) for a JS library.
+
+Hiro has a [detailed guide](https://docs.hiro.so/stacks.js/guides/how-to-integrate-stacking) available for stacking using this library as well as a [Nakamoto guide](https://docs.hiro.so/nakamoto/stacks-js) specifically for the additions made to work with `pox-4`.
+
+### Prerequisites
+
+If you are not familiar with stacking as a concept, it will be useful to [familiarize yourself with that first](https://docs.stacks.co/reference/clarity/example-contracts/broken-reference) before diving into the contract.
+
+***
+
+## Solo Stacking
+
+Solo stacking is the simplest option, and begins by calling the `stack-stx` function.
+
+### stack-stx
+
+This function locks up the given amount of STX for the given lock period (number of reward cycles) for the `tx-sender`.
+
+Here's the full code for that function, then we'll dive into how it works below that.
+
+{% code title="pox-4: stack-stx" %}
+
+```clojure
+(define-public (stack-stx (amount-ustx uint)
+                          (pox-addr (tuple (version (buff 1)) (hashbytes (buff 32))))
+                          (start-burn-ht uint)
+                          (lock-period uint)
+                          (signer-sig (optional (buff 65)))
+                          (signer-key (buff 33))
+                          (max-amount uint)
+                          (auth-id uint))
+    ;; this stacker's first reward cycle is the _next_ reward cycle
+    (let ((first-reward-cycle (+ u1 (current-pox-reward-cycle)))
+          (specified-reward-cycle (+ u1 (burn-height-to-reward-cycle start-burn-ht))))
+      ;; the start-burn-ht must result in the next reward cycle, do not allow stackers
+      ;;  to "post-date" their `stack-stx` transaction
+      (asserts! (is-eq first-reward-cycle specified-reward-cycle)
+                (err ERR_INVALID_START_BURN_HEIGHT))
+
+      ;; must be called directly by the tx-sender or by an allowed contract-caller
+      (asserts! (check-caller-allowed)
+                (err ERR_STACKING_PERMISSION_DENIED))
+
+      ;; tx-sender principal must not be stacking
+      (asserts! (is-none (get-stacker-info tx-sender))
+        (err ERR_STACKING_ALREADY_STACKED))
+
+      ;; tx-sender must not be delegating
+      (asserts! (is-none (get-check-delegation tx-sender))
+        (err ERR_STACKING_ALREADY_DELEGATED))
+
+      ;; the Stacker must have sufficient unlocked funds
+      (asserts! (>= (stx-get-balance tx-sender) amount-ustx)
+        (err ERR_STACKING_INSUFFICIENT_FUNDS))
+
+      ;; Validate ownership of the given signer key
+      (try! (consume-signer-key-authorization pox-addr (- first-reward-cycle u1) "stack-stx" lock-period signer-sig signer-key amount-ustx max-amount auth-id))
+
+      ;; ensure that stacking can be performed
+      (try! (can-stack-stx pox-addr amount-ustx first-reward-cycle lock-period))
+
+      ;; register the PoX address with the amount stacked
+      (let ((reward-set-indexes (try! (add-pox-addr-to-reward-cycles pox-addr first-reward-cycle lock-period amount-ustx tx-sender signer-key))))
+          ;; add stacker record
+         (map-set stacking-state
+           { stacker: tx-sender }
+           { pox-addr: pox-addr,
+             reward-set-indexes: reward-set-indexes,
+             first-reward-cycle: first-reward-cycle,
+             lock-period: lock-period,
+             delegated-to: none })
+
+          ;; return the lock-up information, so the node can actually carry out the lock.
+          (ok { stacker: tx-sender, lock-amount: amount-ustx, signer-key: signer-key, unlock-burn-height: (reward-cycle-to-burn-height (+ first-reward-cycle lock-period)) }))))
+```
+
+{% endcode %}
+
+First let's cover the needed parameters.
+
+* `amount-ustx` is the amount of STX you would like to lock, denoted in micro-STX, or uSTX (1 STX = 1,000,000 uSTX).
+* `pox-addr` is a tuple that encodes the Bitcoin address to be used for the PoX rewards, details below.
+* `start-burn-ht` is the Bitcoin block height you would like to begin stacking. You will receive rewards in the reward cycle following `start-burn-ht`. Importantly, `start-burn-ht` may not be further into the future than the current reward cycle, and in most cases should be set to the current burn block height.
+* `lock-period` sets the number of reward cycles you would like you lock your STX for, this can be between 1 and 12.
+* `signer-sig` is a unique generated signature that proves ownership of this signer. Further details for its role and how to generate it can be found in the [How to Stack](https://docs.stacks.co/reference/clarity/example-contracts/broken-reference) document.
+* `signer-key` is the public key of your signer, more details in the [How to Run a Signer](https://docs.stacks.co/reference/clarity/example-contracts/broken-reference) document.
+* `max-amount` sets the maximum amount allowed to be stacked during the provided stacking period.
+* `auth-id` is a unique string to prevent re-use of this stacking transaction.
+
+{% hint style="warning" %}
+It's important to make sure that these fields match what you pass in to the signer signature generation. If they don't, you will likely get error 35 (`ERR_INVALID_SIGNATURE_PUBKEY`) when trying to submit this transaction as the signer signature will not be valid.
+{% endhint %}
+
+### Supported Reward Address Types
+
+{% hint style="info" %}
+For the `pox-addr` field, the `version` buffer must represent what kind of bitcoin address is being submitted. These are all the possible values you can pass here depending on your address type:
+
+```clojure
+(define-constant ADDRESS_VERSION_P2PKH 0x00)
+(define-constant ADDRESS_VERSION_P2SH 0x01)
+(define-constant ADDRESS_VERSION_P2WPKH 0x02)
+(define-constant ADDRESS_VERSION_P2WSH 0x03)
+(define-constant ADDRESS_VERSION_NATIVE_P2WPKH 0x04)
+(define-constant ADDRESS_VERSION_NATIVE_P2WSH 0x05)
+(define-constant ADDRESS_VERSION_NATIVE_P2TR 0x06)
+```
+
+The `hashbytes` are the 20 hash bytes of the bitcoin address. You can obtain that from a bitcoin library, for instance using [`bitcoinjs-lib`](https://github.com/bitcoinjs/bitcoinjs-lib):
+
+```javascript
+const btc = require("bitcoinjs-lib");
+console.log(
+  "0x" +
+    btc.address
+      .fromBase58Check("1C56LYirKa3PFXFsvhSESgDy2acEHVAEt6")
+      .hash.toString("hex")
+);
+```
+
+{% endhint %}
+
+The `stack-stx` function performs several checks including:
+
+* The `start-burn-ht` results in the next reward cycle
+* The function is being called by the `tx-sender` or an allowed contract caller
+* The `tx-sender` is not currently stacking or delegating
+* The `tx-sender` has enough funds
+* The given `signer-key` is valid, proving ownership
+* Stacking can be performed (amount meets minimum threshold, lock period and bitcoin address are valid)
+
+Next the function registers the provided PoX address for the next reward cycle, assigns its specific reward slot, and adds it to the `stacking-state` map, which keeps track of all current stackers per reward cycle.
+
+Finally it returns the lock-up information so the node can carry out the lock. This step is what actually locks the STX and prevents the stacker from using them on-chain.
+
+From here, the locked STX tokens will be unlocked automatically at the end of the lock period. The stacker can also call `stack-increase` or `stack-extend` to increase the amount locked or extend the time.
+
+***
+
+## Delegated Stacking
+
+Delegated stacking is essentially a multi-step process where delegators give pool operators permission to lock STX on their behalf. The typical flow:
+
+{% stepper %}
+{% step %}
+
+### Step: Delegator delegates their STX to a pool operator
+
+The delegator calls `delegate-stx` to record that they delegate a given amount to a specific pool operator. This does not lock the STX — it only records the delegation permission.
+{% endstep %}
+
+{% step %}
+
+### Step: Pool operator stacks delegated STX (partial)
+
+The pool operator calls `delegate-stack-stx` for each delegator they will lock on behalf of. This marks those STX as partially stacked (not yet in the official reward set).
+{% endstep %}
+
+{% step %}
+
+### Step: Pool operator commits aggregated locks
+
+When the pool operator has aggregated enough delegated STX, they call `stack-aggregation-commit-indexed` (wraps `inner-stack-aggregation-commit`) to commit the aggregated stake into the reward set for the reward cycle.
+{% endstep %}
+{% endstepper %}
+
+There are also alternative actions like revoking delegation (see contract functions).
+
+***
+
+### delegate-stx
+
+This function is called by the individual stacker delegating their STX to a pool operator. An individual stacker choosing to delegate does not need to run their own signer.
+
+This function does not actually lock the STX, but just allows the pool operator to issue the lock.
+
+{% code title="pox-4: delegate-stx" %}
+
+```clojure
+(define-public (delegate-stx (amount-ustx uint)
+                             (delegate-to principal)
+                             (until-burn-ht (optional uint))
+                             (pox-addr (optional { version: (buff 1), hashbytes: (buff 32) })))
+
+    (begin
+      ;; must be called directly by the tx-sender or by an allowed contract-caller
+      (asserts! (check-caller-allowed)
+                (err ERR_STACKING_PERMISSION_DENIED))
+
+      ;; delegate-stx no longer requires the delegator to not currently
+      ;; be stacking.
+      ;; delegate-stack-* functions assert that
+      ;; 1. users can't swim in two pools at the same time.
+      ;; 2. users can't switch pools without cool down cycle.
+      ;;    Other pool admins can't increase or extend.
+      ;; 3. users can't join a pool while already directly stacking.
+
+      ;; pox-addr, if given, must be valid
+      (match pox-addr
+         address
+            (asserts! (check-pox-addr-version (get version address))
+                (err ERR_STACKING_INVALID_POX_ADDRESS))
+         true)
+
+      ;; tx-sender must not be delegating
+      (asserts! (is-none (get-check-delegation tx-sender))
+        (err ERR_STACKING_ALREADY_DELEGATED))
+
+      ;; add delegation record
+      (map-set delegation-state
+        { stacker: tx-sender }
+        { amount-ustx: amount-ustx,
+          delegated-to: delegate-to,
+          until-burn-ht: until-burn-ht,
+          pox-addr: pox-addr })
+
+      (ok true)))
+```
+
+{% endcode %}
+
+Parameters:
+
+* `amount-ustx`: amount delegating (uSTX)
+* `delegate-to`: Stacks address of the pool operator
+* `until-burn-ht`: optional expiry burn height for the delegation
+* `pox-addr`: optional Bitcoin address where this delegator wants rewards sent (if supplied, pool operator must send rewards to this address)
+
+Checks: caller allowed, `pox-addr` version valid if provided, delegator not already delegating. Updates `delegation-state`. No STX are locked yet — the pool operator must call `delegate-stack-stx`.
+
+***
+
+### delegate-stack-stx
+
+Called by the pool operator to partially stack a delegator's STX.
+
+{% code title="pox-4: delegate-stack-stx" %}
+
+```clojure
+(define-public (delegate-stack-stx (stacker principal)
+                                   (amount-ustx uint)
+                                   (pox-addr { version: (buff 1), hashbytes: (buff 32) })
+                                   (start-burn-ht uint)
+                                   (lock-period uint))
+    ;; this stacker's first reward cycle is the _next_ reward cycle
+    (let ((first-reward-cycle (+ u1 (current-pox-reward-cycle)))
+          (specified-reward-cycle (+ u1 (burn-height-to-reward-cycle start-burn-ht)))
+          (unlock-burn-height (reward-cycle-to-burn-height (+ (current-pox-reward-cycle) u1 lock-period))))
+      ;; the start-burn-ht must result in the next reward cycle, do not allow stackers
+      ;;  to "post-date" their `stack-stx` transaction
+      (asserts! (is-eq first-reward-cycle specified-reward-cycle)
+                (err ERR_INVALID_START_BURN_HEIGHT))
+
+      ;; must be called directly by the tx-sender or by an allowed contract-caller
+      (asserts! (check-caller-allowed)
+        (err ERR_STACKING_PERMISSION_DENIED))
+
+      ;; stacker must have delegated to the caller
+      (let ((delegation-info (unwrap! (get-check-delegation stacker) (err ERR_STACKING_PERMISSION_DENIED))))
+        ;; must have delegated to tx-sender
+        (asserts! (is-eq (get delegated-to delegation-info) tx-sender)
+                  (err ERR_STACKING_PERMISSION_DENIED))
+        ;; must have delegated enough stx
+        (asserts! (>= (get amount-ustx delegation-info) amount-ustx)
+                  (err ERR_DELEGATION_TOO_MUCH_LOCKED))
+        ;; if pox-addr is set, must be equal to pox-addr
+        (asserts! (match (get pox-addr delegation-info)
+                         specified-pox-addr (is-eq pox-addr specified-pox-addr)
+                         true)
+                  (err ERR_DELEGATION_POX_ADDR_REQUIRED))
+        ;; delegation must not expire before lock period
+        (asserts! (match (get until-burn-ht delegation-info)
+                         until-burn-ht (>= until-burn-ht
+                                           unlock-burn-height)
+                      true)
+                  (err ERR_DELEGATION_EXPIRES_DURING_LOCK))
+        )
+
+      ;; stacker principal must not be stacking
+      (asserts! (is-none (get-stacker-info stacker))
+        (err ERR_STACKING_ALREADY_STACKED))
+
+      ;; the Stacker must have sufficient unlocked funds
+      (asserts! (>= (stx-get-balance stacker) amount-ustx)
+        (err ERR_STACKING_INSUFFICIENT_FUNDS))
+
+      ;; ensure that stacking can be performed
+      (try! (minimal-can-stack-stx pox-addr amount-ustx first-reward-cycle lock-period))
+
+      ;; register the PoX address with the amount stacked via partial stacking
+      ;;   before it can be included in the reward set, this must be committed!
+      (add-pox-partial-stacked pox-addr first-reward-cycle lock-period amount-ustx)
+
+      ;; add stacker record
+      (map-set stacking-state
+        { stacker: stacker }
+        { pox-addr: pox-addr,
+          first-reward-cycle: first-reward-cycle,
+          reward-set-indexes: (list),
+          lock-period: lock-period,
+          delegated-to: (some tx-sender) })
+
+      ;; return the lock-up information, so the node can actually carry out the lock.
+      (ok { stacker: stacker,
+            lock-amount: amount-ustx,
+            unlock-burn-height: unlock-burn-height })))
+```
+
+{% endcode %}
+
+This function validates the delegation record, ensures the delegator has the funds and is not already stacking, runs lightweight stacking checks, registers the partial stacked amount, and updates `stacking-state`. The STX remain partially stacked until the operator commits.
+
+***
+
+### stack-aggregation-commit-indexed / inner-stack-aggregation-commit
+
+The `stack-aggregation-commit-indexed` function wraps the private `inner-stack-aggregation-commit`. The private function commits partially stacked amounts into the reward set so each pox-addr obtains a reward-slot index.
+
+{% code title="pox-4: inner-stack-aggregation-commit" %}
+
+```clojure
+(define-private (inner-stack-aggregation-commit (pox-addr { version: (buff 1), hashbytes: (buff 32) })
+                                                (reward-cycle uint)
+                                                (signer-sig (optional (buff 65)))
+                                                (signer-key (buff 33))
+                                                (max-amount uint)
+                                                (auth-id uint))
+  (let ((partial-stacked
+         ;; fetch the partial commitments
+         (unwrap! (map-get? partial-stacked-by-cycle { pox-addr: pox-addr, sender: tx-sender, reward-cycle: reward-cycle })
+                  (err ERR_STACKING_NO_SUCH_PRINCIPAL))))
+    ;; must be called directly by the tx-sender or by an allowed contract-caller
+    (asserts! (check-caller-allowed)
+              (err ERR_STACKING_PERMISSION_DENIED))
+    (let ((amount-ustx (get stacked-amount partial-stacked)))
+      (try! (consume-signer-key-authorization pox-addr reward-cycle "agg-commit" u1 signer-sig signer-key amount-ustx max-amount auth-id))
+      (try! (can-stack-stx pox-addr amount-ustx reward-cycle u1))
+      ;; Add the pox addr to the reward cycle, and extract the index of the PoX address
+      ;; so the delegator can later use it to call stack-aggregation-increase.
+      (let ((add-pox-addr-info
+                (add-pox-addr-to-ith-reward-cycle
+                   u0
+                   { pox-addr: pox-addr,
+                     first-reward-cycle: reward-cycle,
+                     num-cycles: u1,
+                     reward-set-indexes: (list),
+                     stacker: none,
+                     signer: signer-key,
+                     amount-ustx: amount-ustx,
+                     i: u0 }))
+           (pox-addr-index (unwrap-panic
+                (element-at (get reward-set-indexes add-pox-addr-info) u0))))
+
+        ;; don't update the stacking-state map,
+        ;;  because it _already has_ this stacker's state
+        ;; don't lock the STX, because the STX is already locked
+        ;;
+        ;; clear the partial-stacked state, and log it
+        (map-delete partial-stacked-by-cycle { pox-addr: pox-addr, sender: tx-sender, reward-cycle: reward-cycle })
+        (map-set logged-partial-stacked-by-cycle { pox-addr: pox-addr, sender: tx-sender, reward-cycle: reward-cycle } partial-stacked)
+        (ok pox-addr-index)))))
+```
+
+{% endcode %}
+
+Key points:
+
+* Validates caller and signer signature.
+* Validates stacking conditions.
+* Adds the aggregated pox-addr to the reward cycle and returns its reward-set index.
+* Deletes the partial-stacked entry and logs it.
+
+***
+
+## How Stacking Reward Distribution Works
+
+All of the above stacking functions take a `pox-addr` field that corresponds to a Bitcoin address where BTC rewards will be sent. It's important to understand how these addresses are used and how reward distribution is handled.
+
+How Bitcoin rewards are distributed is primarily up to the discretion of the pool operator. Since PoX reward distributions are handled using Bitcoin transactions, there is currently not an effective way to automate their distribution to individual delegated stackers.
+
+Role of `pox-addr` by function:
+
+* stack-stx: Bitcoin address for the solo stacker to receive rewards.
+* delegate-stx: Optional. If omitted, the pool operator decides where to send this delegator's rewards. If provided, the pool operator must send rewards to that address. Note: if provided, the delegator must have enough STX to meet the minimum stacking amount (each unique `pox-addr` consumes a reward slot).
+* delegate-stack-stx and stack-aggregation-commit-indexed: `pox-addr` is where the pool operator will receive BTC rewards for that aggregated stake. Pool operators typically use wrapper contracts or off-chain accounting to distribute BTC to delegators.
+
+***
+
+## Errors
+
+You may encounter several errors when trying to perform stacking operations. Below are some of the more common errors with explanations and how to resolve them.
+
+<details>
+
+<summary>Error 35 - ERR_INVALID_SIGNATURE_PUBKEY</summary>
+
+This is likely the most common error you will encounter, and you'll usually see it in a failed `stack-stx` or `stack-aggregation-commit` transaction.
+
+This error occurs in `consume-signer-key-authorization` which is called any time a signer signature is provided.
+
+Possible causes:
+
+* The public key you used to generate the signer signature is not the same as the one you are passing in to the `signer-key` field.
+* One of the fields you passed in to generate your signer signature does not match the field you passed in to either the `stack-stx` or `stack-aggregation-commit` function.
+
+How to fix: verify that the signer signature was generated using the exact same signer public key and parameters (amount, pox-addr/reward-cycle, lock period, max-amount, auth-id, etc.) as what you are passing into the contract call.
+
+</details>
+
+<details>
+
+<summary>Error 4 - ERR_STACKING_NO_SUCH_PRINCIPAL</summary>
+
+This error means the contract lookup for a partially stacked entry failed. The stacking contract looks up partially stacked STX (after `delegate-stack-stx`) by the key `(pox-addr, stx-address, reward-cycle)`. If any of those parameters are wrong when generating the signature or calling `stack-aggregation-commit`, the lookup will fail.
+
+How to fix: check that the `pox-addr`, `stacker` principal (stx address), and `reward-cycle` values match exactly what was used in `delegate-stack-stx` / the signature generation. See the [stacking guide](https://docs.stacks.co/reference/clarity/example-contracts/broken-reference) for delegation flow details.
+
+</details>
+
+<details>
+
+<summary>Error 24 - ERR_INVALID_START_BURN_HEIGHT</summary>
+
+This means the `start-burn-height` parameter parsed was invalid (it corresponded to a past or future cycle rather than the current next reward cycle). You will mostly see this in `stack-stx` or `delegate-stack-stx` failed transactions.
+
+How to fix: set `start-burn-ht` to the current burn block height corresponding to the next reward cycle (or compute it using node APIs / libraries that map burn height to reward cycles).
+
+</details>
+
+
+
+
+# bns
+
+The Bitcoin Name System (BNS) is implemented as a smart contract using Clarity.
+
+Below is a list of public and read-only functions as well as error codes that can be returned by those methods.
+
+***
+
+## Public functions
+
+### name-import
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(name-import namespace name beneficiary zonefile-hash)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 48), principal, (buff 20)`\
+Output: `(response bool int)`
+
+Description:\
+Imports name to a revealed namespace. Each imported name is given both an owner and some off-chain state.
+
+***
+
+### name-preorder
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(name-preorder hashed-salted-fqn stx-to-burn)
+```
+
+{% endcode %}
+
+Input: `(buff 20), uint`\
+Output: `(response uint int)`
+
+Description:\
+Preorders a name by telling all BNS nodes the salted hash of the BNS name. It pays the registration fee to the namespace owner's designated address.
+
+***
+
+### name-register
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(name-register namespace name salt zonefile-hash)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 48), (buff 20), (buff 20)`\
+Output: `(response bool int)`
+
+Description:\
+Reveals the salt and the name to all BNS nodes, and assigns the name an initial public key hash and zone file hash.
+
+***
+
+### name-renewal
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(name-renewal namespace name stx-to-burn new-owner zonefile-hash)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 48), uint, (optional principal), (optional (buff 20))`\
+Output: `(response bool int)`
+
+Description:\
+Depending on the namespace rules, a name can expire. For example, names in the .id namespace expire after 2 years. You need to send a name renewal every so often to keep your name.
+
+You will pay the registration cost of your name to the namespace's designated burn address when you renew it. When a name expires, it enters a "grace period". The period is set to 5000 blocks (a month) but can be configured for each namespace.
+
+It will stop resolving in the grace period, and all of the above operations will cease to be honored by the BNS consensus rules. You may, however, send a NAME\_RENEWAL during this grace period to preserve your name. After the grace period, everybody can register that name again. If your name is in a namespace where names do not expire, then you never need to use this transaction.
+
+***
+
+### name-revoke
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(name-revoke namespace name)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 48)`\
+Output: `(response bool int)`
+
+Description:\
+Makes a name unresolvable. The BNS consensus rules stipulate that once a name is revoked, no one can change its public key hash or its zone file hash. The name's zone file hash is set to null to prevent it from resolving. You should only do this if your private key is compromised, or if you want to render your name unusable for whatever reason.
+
+***
+
+### name-transfer
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(name-transfer namespace name new-owner zonefile-hash)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 48), principal, (optional (buff 20))`\
+Output: `(response bool int)`
+
+Description:\
+Changes the name's public key hash. You would send a name transfer transaction if you wanted to:
+
+* Change your private key
+* Send the name to someone else
+* Update your zone file
+
+When transferring a name, you have the option to also clear the name's zone file hash (i.e. set it to null). This is useful for when you send the name to someone else, so the recipient's name does not resolve to your zone file.
+
+***
+
+### name-update
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(name-update namespace name zonefile-hash)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 48), (buff 20)`\
+Output: `(response bool int)`
+
+Description:\
+Changes the name's zone file hash. You would send a name update transaction if you wanted to change the name's zone file contents. For example, you would do this if you want to deploy your own Gaia hub and want other people to read from it.
+
+***
+
+### namespace-preorder
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(namespace-preorder hashed-salted-namespace stx-to-burn)
+```
+
+{% endcode %}
+
+Input: `(buff 20), uint`\
+Output: `(response uint int)`
+
+Description:\
+Registers the salted hash of the namespace with BNS nodes, and burns the requisite amount of cryptocurrency. Additionally, this step proves to the BNS nodes that user has honored the BNS consensus rules by including a recent consensus hash in the transaction. Returns pre-order's expiration date (in blocks).
+
+***
+
+### namespace-ready
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(namespace-ready namespace)
+```
+
+{% endcode %}
+
+Input: `(buff 20)`\
+Output: `(response bool int)`
+
+Description:\
+Launches the namespace and makes it available to the public. Once a namespace is launched, anyone can register a name in it if they pay the appropriate amount of cryptocurrency.
+
+***
+
+### namespace-reveal
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(namespace-reveal namespace namespace-salt p-func-base p-func-coeff p-func-b1 p-func-b2 p-func-b3 p-func-b4 p-func-b5 p-func-b6 p-func-b7 p-func-b8 p-func-b9 p-func-b10 p-func-b11 p-func-b12 p-func-b13 p-func-b14 p-func-b15 p-func-b16 p-func-non-alpha-discount p-func-no-vowel-discount lifetime namespace-import)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 20), uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, uint, principal`\
+Output: `(response bool int)`
+
+Description:\
+Reveals the salt and the namespace ID (after a namespace preorder). It reveals how long names last in this namespace before they expire or must be renewed, and it sets a price function for the namespace that determines how cheap or expensive names will be. All of the parameters prefixed by `p` make up the price function. These parameters govern the pricing and lifetime of names in the namespace.
+
+Rules for a namespace:
+
+* A name can fall into one of 16 buckets, measured by length. Bucket 16 incorporates all names at least 16 characters long.
+* The pricing structure applies a multiplicative penalty for having numeric characters, or punctuation characters.
+* The price of a name in a bucket is: ((coeff) \* (base) ^ (bucket exponent)) / ((numeric discount multiplier) \* (punctuation discount multiplier))
+
+Example parameters:
+
+* base = 10
+* coeff = 2
+* nonalpha discount: 10
+* no-vowel discount: 10
+* buckets 1, 2: 9
+* buckets 3, 4, 5, 6: 8
+* buckets 7–14: 7
+* buckets 15, 16+: (not specified in source)
+
+***
+
+## Read-only functions
+
+### can-name-be-registered
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(can-name-be-registered namespace name)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 48)`\
+Output: `(response bool int)`
+
+Description:\
+Returns true if the provided name can be registered.
+
+***
+
+### can-namespace-be-registered
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(can-namespace-be-registered namespace)
+```
+
+{% endcode %}
+
+Input: `(buff 20)`\
+Output: `(response bool UnknownType)`
+
+Description:\
+Returns true if the provided namespace is available.
+
+***
+
+### can-receive-name
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(can-receive-name owner)
+```
+
+{% endcode %}
+
+Input: `principal`\
+Output: `(response bool int)`
+
+Description:\
+Returns true if the provided name can be received. That is, if it is not currently owned, a previous lease is expired, and the name wasn't revoked.
+
+***
+
+### get-name-price
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(get-name-price namespace name)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 48)`\
+Output: `(response uint int)`
+
+Description:\
+Gets the price for a name.
+
+***
+
+### get-namespace-price
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(get-namespace-price namespace)
+```
+
+{% endcode %}
+
+Input: `(buff 20)`\
+Output: `(response uint int)`
+
+Description:\
+Gets the price for a namespace.
+
+***
+
+### get-namespace-properties
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(get-namespace-properties namespace)
+```
+
+{% endcode %}
+
+Input: `(buff 20)`\
+Output: `(response (tuple (namespace (buff 20)) (properties (tuple (can-update-price-function bool) (launched-at (optional uint)) (lifetime uint) (namespace-import principal) (price-function (tuple (base uint) (buckets (list 16 uint)) (coeff uint) (no-vowel-discount uint) (nonalpha-discount uint))) (revealed-at uint)))) int)`
+
+Description:\
+Get namespace properties.
+
+***
+
+### is-name-lease-expired
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(is-name-lease-expired namespace name)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 48)`\
+Output: `(response bool int)`
+
+Description:\
+Return true if the provided name lease is expired.
+
+***
+
+### name-resolve
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(name-resolve namespace name)
+```
+
+{% endcode %}
+
+Input: `(buff 20), (buff 48)`\
+Output: `(response (tuple (lease-ending-at (optional uint)) (lease-started-at uint) (owner principal) (zonefile-hash (buff 20))) int)`
+
+Description:\
+Get name registration details.
+
+***
+
+### resolve-principal
+
+Signature:
+
+{% code title="Signature" %}
+
+```clojure
+(resolve-principal owner)
+```
+
+{% endcode %}
+
+Input: `principal`\
+Output: `(response (tuple (name (buff 48)) (namespace (buff 20))) (tuple (code int) (name (optional (tuple (name (buff 48)) (namespace (buff 20)))))))`
+
+Description:\
+Returns the registered name that a principal owns if there is one. A principal can only own one name at a time.
+
+***
+
+## Error codes
+
+* ERR\_INSUFFICIENT\_FUNDS — type: int, value: 4001
+* ERR\_NAMESPACE\_ALREADY\_EXISTS — type: int, value: 1006
+* ERR\_NAMESPACE\_ALREADY\_LAUNCHED — type: int, value: 1014
+* ERR\_NAMESPACE\_BLANK — type: int, value: 1013
+* ERR\_NAMESPACE\_CHARSET\_INVALID — type: int, value: 1016
+* ERR\_NAMESPACE\_HASH\_MALFORMED — type: int, value: 1015
+* ERR\_NAMESPACE\_NOT\_FOUND — type: int, value: 1005
+* ERR\_NAMESPACE\_NOT\_LAUNCHED — type: int, value: 1007
+* ERR\_NAMESPACE\_OPERATION\_UNAUTHORIZED — type: int, value: 1011
+* ERR\_NAMESPACE\_PREORDER\_ALREADY\_EXISTS — type: int, value: 1003
+* ERR\_NAMESPACE\_PREORDER\_CLAIMABILITY\_EXPIRED — type: int, value: 1009
+* ERR\_NAMESPACE\_PREORDER\_EXPIRED — type: int, value: 1002
+* ERR\_NAMESPACE\_PREORDER\_LAUNCHABILITY\_EXPIRED — type: int, value: 1010
+* ERR\_NAMESPACE\_PREORDER\_NOT\_FOUND — type: int, value: 1001
+* ERR\_NAMESPACE\_PRICE\_FUNCTION\_INVALID — type: int, value: 1008
+* ERR\_NAMESPACE\_STX\_BURNT\_INSUFFICIENT — type: int, value: 1012
+* ERR\_NAMESPACE\_UNAVAILABLE — type: int, value: 1004
+* ERR\_NAME\_ALREADY\_CLAIMED — type: int, value: 2011
+* ERR\_NAME\_BLANK — type: int, value: 2010
+* ERR\_NAME\_CHARSET\_INVALID — type: int, value: 2022
+* ERR\_NAME\_CLAIMABILITY\_EXPIRED — type: int, value: 2012
+* ERR\_NAME\_COULD\_NOT\_BE\_MINTED — type: int, value: 2020
+* ERR\_NAME\_COULD\_NOT\_BE\_TRANSFERRED — type: int, value: 2021
+* ERR\_NAME\_EXPIRED — type: int, value: 2008
+* ERR\_NAME\_GRACE\_PERIOD — type: int, value: 2009
+* ERR\_NAME\_HASH\_MALFORMED — type: int, value: 2017
+* ERR\_NAME\_NOT\_FOUND — type: int, value: 2013
+* ERR\_NAME\_NOT\_RESOLVABLE — type: int, value: 2019
+* ERR\_NAME\_OPERATION\_UNAUTHORIZED — type: int, value: 2006
+* ERR\_NAME\_PREORDERED\_BEFORE\_NAMESPACE\_LAUNCH — type: int, value: 2018
+* ERR\_NAME\_PREORDER\_ALREADY\_EXISTS — type: int, value: 2016
+* ERR\_NAME\_PREORDER\_EXPIRED — type: int, value: 2002
+* ERR\_NAME\_PREORDER\_FUNDS\_INSUFFICIENT — type: int, value: 2003
+* ERR\_NAME\_PREORDER\_NOT\_FOUND — type: int, value: 2001
+* ERR\_NAME\_REVOKED — type: int, value: 2014
+* ERR\_NAME\_STX\_BURNT\_INSUFFICIENT — type: int, value: 2007
+* ERR\_NAME\_TRANSFER\_FAILED — type: int, value: 2015
+* ERR\_NAME\_UNAVAILABLE — type: int, value: 2004
+* ERR\_PANIC — type: int, value: 0
+* ERR\_PRINCIPAL\_ALREADY\_ASSOCIATED — type: int, value: 3001
+
+
+
+..---------------------------
+
+# CLI Reference
+
+The Clarinet CLI provides a comprehensive suite of tools for Clarity smart contract development. From project initialization to deployment, Clarinet streamlines your entire development workflow.
+
+* Create a new project: `clarinet new`
+* Generate a new smart contract: `clarinet contracts new`
+* Validate contract syntax and types: `clarinet check`
+* Interactive REPL for testing contracts: `clarinet console`
+* Launch a local development network: `clarinet devnet start`
+* Manage deployments: `clarinet deployments`
+
+## Initialize a new project
+
+### clarinet new
+
+`clarinet new` creates a new project with all necessary configuration files and directory structure.
+
+Usage
+
+```
+clarinet new [OPTIONS] <NAME>
+```
+
+```bash
+$ clarinet new my-defi-protocol
+Create directory my-defi-protocol
+Create directory contracts
+Create directory settings
+Create directory tests
+Create file Clarinet.toml
+Create file settings/Mainnet.toml
+Create file settings/Testnet.toml
+Create file settings/Devnet.toml
+Create directory .vscode
+Create file .vscode/settings.json
+Create file .vscode/tasks.json
+Create file .gitignore
+Create file .gitattributes
+Create file package.json
+Create file tsconfig.json
+Create file vitest.config.js
+```
+
+| Option                | Description                                               |
+| --------------------- | --------------------------------------------------------- |
+| `--disable-telemetry` | Do not provide developer usage telemetry for this project |
+
+## Manage your contracts
+
+### clarinet contracts
+
+`clarinet contracts` is a subcommand for working with contracts. It has two subcommands:
+
+| Command | Description                                    |
+| ------- | ---------------------------------------------- |
+| `new`   | Generate files and settings for a new contract |
+| `rm`    | Remove files and settings for a contract       |
+
+Usage with `new`
+
+```
+clarinet contracts new <COMMAND> <OPTIONS>
+```
+
+```bash
+$ clarinet contracts new fungible-token
+Created file contracts/fungible-token.clar
+Created file tests/fungible-token.test.ts
+Updated Clarinet.toml
+```
+
+Usage with `rm`
+
+```
+clarinet contracts rm <COMMAND> <OPTIONS>
+```
+
+```bash
+$ clarinet contracts rm old-token
+Removed file contracts/old-token.clar
+Removed file tests/old-token.test.ts
+Updated Clarinet.toml
+```
+
+| Option                   | Description           |
+| ------------------------ | --------------------- |
+| `--manifest-path <path>` | Path to Clarinet.toml |
+
+## Validate your contracts
+
+### clarinet check
+
+`clarinet check` checks contracts syntax and performs type checking.
+
+Usage
+
+```
+clarinet check [FILE] [OPTIONS]
+```
+
+```bash
+clarinet check
+✔ 3 contracts checked
+clarinet check contracts/token.clar
+✔ contracts/token.clar syntax checks passed
+```
+
+| Option                           | Short | Description                                                                           |
+| -------------------------------- | ----- | ------------------------------------------------------------------------------------- |
+| `--manifest-path <path>`         | `-m`  | Path to Clarinet.toml                                                                 |
+| `--deployment-plan-path <path>`  | `-p`  | If specified, use this deployment file                                                |
+| `--use-on-disk-deployment-plan`  | `-d`  | Use on disk deployment plan (prevent updates computing)                               |
+| `--use-computed-deployment-plan` | `-c`  | Use computed deployment plan (will overwrite on disk version if any update)           |
+| `--enable-clarity-wasm`          |       | Allow the Clarity Wasm preview to run in parallel with the Clarity interpreter (beta) |
+
+## Interact with your contracts in a local REPL
+
+### clarinet console
+
+`clarinet console` loads contracts in a REPL for an interactive session.
+
+Usage
+
+```
+clarinet console [OPTIONS]
+```
+
+```bash
+$ clarinet console
+clarity-repl v1.0.0
+Enter ".help" for usage hints.
+Connected to a transient in-memory database.
+```
+
+The Clarinet console offers a variety of commands for contract interaction:
+
+* `::help`: Lists all console commands
+* `::functions`: Display all the native functions available in Clarity
+* `::keywords`: Display all the native keywords available in Clarity
+* `::describe <function> | <keyword>`: Display documentation for a given native function or keyword
+* `::toggle_costs`: Display cost analysis after every expression
+* `::toggle_timings`: Display the execution duration
+* `::mint_stx <principal> <amount>`: Mint STX balance for a given principal
+* `::set_tx_sender <principal>`: Set tx-sender variable to principal
+* `::get_assets_maps`: Get assets maps for active accounts
+* `::get_contracts`: Get contracts
+* `::get_block_height`: Get current block height
+* `::advance_chain_tip <count>`: Simulate mining of `<count>` blocks
+* `::advance_stacks_chain_tip <count>`: Simulate mining of `<count>` stacks blocks
+* `::advance_burn_chain_tip <count>`: Simulate mining of `<count>` burnchain blocks
+* `::set_epoch <epoch>`: Update the current epoch
+* `::get_epoch`: Get current epoch
+* `::debug <expr>`: Start an interactive debug session executing `<expr>`
+* `::trace <expr>`: Generate an execution trace for `<expr>`
+* `::get_costs <expr>`: Display the cost analysis
+* `::reload`: Reload the existing contract(s) in the session
+* `::read <filename>`: Read expressions from a file
+* `::encode <expr>`: Encode an expression to a Clarity Value bytes representation
+* `::decode <bytes>`: Decode a Clarity Value bytes representation
+
+| Option                                  | Short | Description                                                                           |
+| --------------------------------------- | ----- | ------------------------------------------------------------------------------------- |
+| `--manifest-path <path>`                | `-m`  | Path to Clarinet.toml                                                                 |
+| `--deployment-plan-path <path>`         | `-p`  | If specified, use this deployment file                                                |
+| `--use-on-disk-deployment-plan`         | `-d`  | Use on disk deployment plan (prevent updates computing)                               |
+| `--use-computed-deployment-plan`        | `-c`  | Use computed deployment plan (will overwrite on disk version if any update)           |
+| `--enable-remote-data`                  | `-r`  | Enable remote data fetching from mainnet or a testnet                                 |
+| `--remote-data-api-url <url>`           | `-a`  | Set a custom Stacks Blockchain API URL for remote data fetching                       |
+| `--remote-data-initial-height <height>` | `-b`  | Initial remote Stacks block height                                                    |
+| `--enable-clarity-wasm`                 |       | Allow the Clarity Wasm preview to run in parallel with the Clarity interpreter (beta) |
+
+## Start a local development network
+
+### clarinet devnet
+
+`clarinet devnet` is a subcommand for working with Devnet. It has two subcommands:
+
+| Command   | Description                                                      |
+| --------- | ---------------------------------------------------------------- |
+| `start`   | Start a local Devnet network for interacting with your contracts |
+| `package` | Generate package of all required devnet artifacts                |
+
+Usage with `start`
+
+```
+clarinet devnet start [OPTIONS]
+```
+
+```bash
+clarinet devnet start
+```
+
+| Option                           | Short | Description                                                                 |
+| -------------------------------- | ----- | --------------------------------------------------------------------------- |
+| `--manifest-path <path>`         | `-m`  | Path to Clarinet.toml                                                       |
+| `--no-dashboard`                 |       | Display streams of logs instead of terminal UI dashboard                    |
+| `--deployment-plan-path <path>`  | `-p`  | If specified, use this deployment file                                      |
+| `--use-on-disk-deployment-plan`  | `-d`  | Use on disk deployment plan (prevent updates computing)                     |
+| `--use-computed-deployment-plan` | `-c`  | Use computed deployment plan (will overwrite on disk version if any update) |
+| `--package <path>`               |       | Path to Package.json produced by 'clarinet devnet package'                  |
+
+Usage with `package`
+
+```
+clarinet devnet package [OPTIONS]
+```
+
+```bash
+$ clarinet devnet package --name my-devnet
+Packaging devnet artifacts...
+Created file my-devnet.json
+```
+
+| Option                   | Short | Description           |
+| ------------------------ | ----- | --------------------- |
+| `--name <name>`          | `-n`  | Output json file name |
+| `--manifest-path <path>` | `-m`  | Path to Clarinet.toml |
+
+## Manage your deployments
+
+### clarinet deployments
+
+`clarinet deployments` is a subcommand for managing deployments on Devnet/Testnet/Mainnet.
+
+| Command    | Description              |
+| ---------- | ------------------------ |
+| `check`    | Check deployments format |
+| `generate` | Generate new deployment  |
+| `apply`    | Apply deployment         |
+
+Usage with `check`
+
+```
+clarinet deployments check [OPTIONS]
+```
+
+```bash
+$ clarinet deployments check
+✔ Deployment files are valid
+```
+
+| Option                   | Description           |
+| ------------------------ | --------------------- |
+| `--manifest-path <path>` | Path to Clarinet.toml |
+
+Usage with `generate`
+
+```
+clarinet deployments generate [OPTIONS]
+```
+
+```bash
+$ clarinet deployments generate --testnet
+Generated deployment plan
+Created file deployments/default.testnet-plan.yaml
+```
+
+| Option                   | Description                                                                   |
+| ------------------------ | ----------------------------------------------------------------------------- |
+| `--simnet`               | Generate a deployment file for simnet environments (console, tests)           |
+| `--devnet`               | Generate a deployment file for devnet, using settings/Devnet.toml             |
+| `--testnet`              | Generate a deployment file for testnet, using settings/Testnet.toml           |
+| `--mainnet`              | Generate a deployment file for mainnet, using settings/Mainnet.toml           |
+| `--manifest-path <path>` | Path to Clarinet.toml                                                         |
+| `--no-batch`             | Generate a deployment file without trying to batch transactions (simnet only) |
+| `--low-cost`             | Compute and set cost, using low priority (network connection required)        |
+| `--medium-cost`          | Compute and set cost, using medium priority (network connection required)     |
+| `--high-cost`            | Compute and set cost, using high priority (network connection required)       |
+| `--manual-cost`          | Leave cost estimation manual                                                  |
+
+Usage with `apply`
+
+```
+clarinet deployments apply [OPTIONS]
+```
+
+```bash
+$ clarinet deployments apply --testnet
+Applying deployment to testnet
+✔ Broadcasting transaction for token.clar
+  Transaction ID: 0x3d4f5...
+  Contract: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.token
+✔ All contracts deployed successfully
+```
+
+| Option                           | Short | Description                                                                 |
+| -------------------------------- | ----- | --------------------------------------------------------------------------- |
+| `--devnet`                       |       | Apply default deployment settings/default.devnet-plan.toml                  |
+| `--testnet`                      |       | Apply default deployment settings/default.testnet-plan.toml                 |
+| `--mainnet`                      |       | Apply default deployment settings/default.mainnet-plan.toml                 |
+| `--manifest-path <path>`         | `-m`  | Path to Clarinet.toml                                                       |
+| `--deployment-plan-path <path>`  | `-p`  | Apply deployment plan specified                                             |
+| `--no-dashboard`                 |       | Display streams of logs instead of terminal UI dashboard                    |
+| `--use-on-disk-deployment-plan`  | `-d`  | Use on disk deployment plan (prevent updates computing)                     |
+| `--use-computed-deployment-plan` | `-c`  | Use computed deployment plan (will overwrite on disk version if any update) |
+
+## Interact with Mainnet contracts
+
+### clarinet requirements
+
+`clarinet requirements` is a subcommand for interacting with Mainnet contracts.
+
+| Command | Description                                            |
+| ------- | ------------------------------------------------------ |
+| `add`   | Add a mainnet contract as a dependency to your project |
+
+Usage
+
+```
+clarinet requirements <COMMAND>
+```
+
+```bash
+$ clarinet requirements add SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait
+Added requirement SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait
+Updated Clarinet.toml
+```
+
+| Option                   | Description           |
+| ------------------------ | --------------------- |
+| `--manifest-path <path>` | Path to Clarinet.toml |
+
+## Editor Integrations
+
+### clarinet lsp
+
+`clarinet lsp` starts the Language Server Protocol service for Clarity, enabling intelligent code completion, error highlighting, and other IDE features in supported editors.
+
+Usage
+
+```
+clarinet lsp
+```
+
+## Debugging
+
+### clarinet dap
+
+`clarinet dap` starts the Debug Adapter Protocol service, enabling debugging features like breakpoints, step-through execution, and variable inspection in supported editors.
+
+Usage
+
+```
+clarinet dap
+```
+
+## Format your code
+
+### clarinet format
+
+`clarinet format` formats Clarity code files according to standard conventions.
+
+Usage
+
+```
+clarinet format [OPTIONS]
+```
+
+```bash
+clarinet format --check
+clarinet format --dry-run
+clarinet format --file contracts/token.clar --in-place
+```
+
+| Option                       | Short | Description                                            | Required |
+| ---------------------------- | ----- | ------------------------------------------------------ | -------- |
+| `--check`                    |       | Check if code is formatted without modifying files     | No       |
+| `--dry-run`                  |       | Only echo the result of formatting                     | No       |
+| `--in-place`                 |       | Replace the contents of a file with the formatted code | No       |
+| `--manifest-path <path>`     | `-m`  | Path to Clarinet.toml                                  | No       |
+| `--file <file>`              | `-f`  | If specified, format only this file                    | No       |
+| `--max-line-length <length>` | `-l`  | Maximum line length                                    | No       |
+| `--indent <size>`            | `-i`  | Indentation size, e.g. 2                               | No       |
+| `--tabs`                     | `-t`  | Use tabs instead of spaces                             | No       |
+
+## Utilities
+
+### clarinet completions
+
+`clarinet completions` generates shell completion scripts for your shell.
+
+Usage
+
+```
+clarinet completions <SHELL>
+```
+
+```bash
+clarinet completions zsh > ~/.zsh/completions/_clarinet
+source ~/.zshrc
+```
+
+Supported Shells
+
+* `bash`
+* `zsh`
+* `fish`
+* `powershell`
+* `elvish`
+
+| Option            | Short | Description                                              |
+| ----------------- | ----- | -------------------------------------------------------- |
+| `--shell <shell>` | `-s`  | Specify which shell to generation completions script for |
+
+## Environment Variables
+
+Clarinet supports environment variables for configuration. All environment variables are prefixed with `CLARINET_`:
+
+```bash
+export CLARINET_MANIFEST_PATH=/path/to/project
+```
+
+
+--------------------------------------------------------------------------------
+
+# SDK Reference
+
+The Clarinet JS SDK provides a comprehensive suite of helpers for testing and interacting with Clarity smart contracts. From simnet initialization to contract deployment, the SDK streamlines your entire testing workflow.
+
+* Initialize a simulated network: `initSimnet`
+* Manage contract state: `getDataVar`, `getMapEntry`
+* Call contract functions: `callReadOnlyFn`, `callPublicFn`
+* Transfer STX: `transferSTX`
+* Deploy contracts: `deployContract`
+* Mine blocks: `mineBlock`, `mineEmptyBlock`
+* Custom assertions: `toBeOk`, `toBeErr`
+
+## Installation
+
+```bash
+npm install @stacks/clarinet-sdk
+```
+
+## Initialize simulated network
+
+### initSimnet
+
+`initSimnet` initializes a simulated network for testing your smart contracts.
+
+Usage:
+
+```
+initSimnet(manifestPath?: string): Promise<Simnet>
+```
+
+```ts
+import { initSimnet } from '@stacks/clarinet-sdk';
+
+const simnet = await initSimnet();
+```
+
+| Parameter      | Type     | Description                                  |
+| -------------- | -------- | -------------------------------------------- |
+| `manifestPath` | `string` | Optional path to Clarinet.toml manifest file |
+
+## Simnet properties
+
+### blockHeight
+
+Returns the current block height of simnet.
+
+```ts
+const currentBlockHeight = simnet.blockHeight;
+// Returns: 1
+```
+
+### deployer
+
+Returns the default deployer address as defined in the project file.
+
+```ts
+const deployerAddress = simnet.deployer;
+// Returns: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+```
+
+You can also update the deployer:
+
+```ts
+simnet.deployer = 'ST1SJ3DTE5DN7X54YDH5D64R3BCB6A2AG2ZQ8YPD5';
+```
+
+### currentEpoch
+
+Returns the current epoch of simnet (e.g., 2.5 for Stacks 2.5).
+
+```ts
+const epoch = simnet.currentEpoch;
+// Returns: 2.5
+```
+
+## Account management
+
+### getAccounts
+
+`getAccounts` retrieves all configured Stacks addresses including wallets, deployers, and faucets.
+
+Usage:
+
+```
+getAccounts(): Map<string, string>
+```
+
+```ts
+const accounts = simnet.getAccounts();
+const wallet1 = accounts.get('wallet_1')!;
+// Returns: ST1SJ3DTE5DN7X54YDH5D64R3BCB6A2AG2ZQ8YPD5
+```
+
+## Asset balances
+
+### getAssetsMap
+
+`getAssetsMap` retrieves asset balances for all addresses, including STX, fungible, and non-fungible tokens.
+
+Usage:
+
+```
+getAssetsMap(): Map<string, Map<string, bigint>>
+```
+
+```ts
+const assets = simnet.getAssetsMap();
+const stxBalances = assets.get('STX')!;
+const deployerBalance = stxBalances.get(simnet.deployer)!;
+// Returns: 100000000000000n
+```
+
+## Read contract state
+
+### getDataVar
+
+`getDataVar` retrieves the value of a data variable from a contract.
+
+Usage:
+
+```
+getDataVar(contract: string, dataVar: string): ClarityValue
+```
+
+```ts
+const count = simnet.getDataVar('counter', 'count');
+// Returns: { type: 1, value: 1n }
+```
+
+| Parameter  | Type     | Description               |
+| ---------- | -------- | ------------------------- |
+| `contract` | `string` | Contract identifier       |
+| `dataVar`  | `string` | Name of the data variable |
+
+### getMapEntry
+
+`getMapEntry` retrieves a value from a contract map by its key.
+
+Usage:
+
+```
+getMapEntry(contract: string, mapName: string, mapKey: ClarityValue): ClarityValue
+```
+
+```ts
+import { Cl } from '@stacks/transactions';
+
+const hasParticipated = simnet.getMapEntry(
+  "pool",
+  "Participants",
+  Cl.standardPrincipal(wallet)
+);
+// Returns: { type: 10, value: { type: 3 } }
+```
+
+| Parameter  | Type           | Description         |
+| ---------- | -------------- | ------------------- |
+| `contract` | `string`       | Contract identifier |
+| `mapName`  | `string`       | Name of the map     |
+| `mapKey`   | `ClarityValue` | Key to look up      |
+
+## Call contract functions
+
+### callReadOnlyFn
+
+`callReadOnlyFn` calls read-only functions without mining a block.
+
+Usage:
+
+```
+callReadOnlyFn(
+  contract: string,
+  method: string,
+  args: ClarityValue[],
+  sender: string
+): ParsedTransactionResult
+```
+
+```ts
+import { Cl } from '@stacks/transactions';
+
+const result = simnet.callReadOnlyFn(
+  'pool',
+  'get-contribution-amount',
+  [Cl.standardPrincipal(wallet)],
+  wallet
+);
+// Returns: { result: { type: 1, value: 42000000n }, events: [] }
+```
+
+| Parameter  | Type             | Description         |
+| ---------- | ---------------- | ------------------- |
+| `contract` | `string`         | Contract identifier |
+| `method`   | `string`         | Function name       |
+| `args`     | `ClarityValue[]` | Function arguments  |
+| `sender`   | `string`         | Sender address      |
+
+### callPublicFn
+
+`callPublicFn` calls public functions and mines a block.
+
+Usage:
+
+```
+callPublicFn(
+  contract: string,
+  method: string,
+  args: ClarityValue[],
+  sender: string
+): ParsedTransactionResult
+```
+
+```ts
+import { Cl } from '@stacks/transactions';
+
+const result = simnet.callPublicFn(
+  'pool',
+  'register-participant',
+  [Cl.standardPrincipal(wallet)],
+  wallet
+);
+// Mines block and returns result
+```
+
+### callPrivateFn
+
+`callPrivateFn` calls private functions (testing only) and mines a block.
+
+Usage:
+
+```
+callPrivateFn(
+  contract: string,
+  method: string,
+  args: ClarityValue[],
+  sender: string
+): ParsedTransactionResult
+```
+
+```ts
+const result = simnet.callPrivateFn(
+  "pool",
+  "reward-participant-points",
+  [Cl.standardPrincipal(address1)],
+  wallet
+);
+```
+
+## Transfer STX
+
+`transferSTX` transfers STX between addresses and mines a block.
+
+Usage:
+
+```
+transferSTX(
+  amount: number | bigint,
+  recipient: string,
+  sender: string
+): ParsedTransactionResult
+```
+
+```ts
+const transfer = simnet.transferSTX(
+  42000000, // 42 STX in microSTX
+  recipient,
+  simnet.deployer
+);
+// Returns transaction result with transfer event
+```
+
+| Parameter   | Type               | Description        |
+| ----------- | ------------------ | ------------------ |
+| `amount`    | `number \| bigint` | Amount in microSTX |
+| `recipient` | `string`           | Recipient address  |
+| `sender`    | `string`           | Sender address     |
+
+## Deploy contracts
+
+`deployContract` deploys a new contract to simnet and mines a block.
+
+Usage:
+
+```
+deployContract(
+  name: string,
+  content: string,
+  options: DeployContractOptions | null,
+  sender: string
+): ParsedTransactionResult
+```
+
+```ts
+const sourceCode = '(define-read-only (say-hi) (ok "Hello World"))';
+
+const contract = simnet.deployContract(
+  'hello-world',
+  sourceCode,
+  { clarityVersion: 2 },
+  simnet.deployer
+);
+```
+
+| Parameter | Type             | Description         |
+| --------- | ---------------- | ------------------- |
+| `name`    | `string`         | Contract name       |
+| `content` | `string`         | Clarity source code |
+| `options` | `object \| null` | Deployment options  |
+| `sender`  | `string`         | Deployer address    |
+
+## Block mining
+
+### mineBlock
+
+`mineBlock` mines a block with multiple transactions.
+
+Usage:
+
+```
+mineBlock(txs: Tx[]): ParsedTransactionResult[]
+```
+
+```ts
+import { tx } from '@stacks/clarinet-sdk';
+import { Cl } from '@stacks/transactions';
+
+const block = simnet.mineBlock([
+  tx.callPublicFn("counter", "increment", [], simnet.deployer),
+  tx.transferSTX(19000000, wallet, simnet.deployer),
+]);
+```
+
+### mineEmptyBlock
+
+`mineEmptyBlock` mines an empty block and increases block height.
+
+Usage:
+
+```
+mineEmptyBlock(): number
+```
+
+```ts
+simnet.mineEmptyBlock();
+const newHeight = simnet.blockHeight;
+// Returns: 2
+```
+
+### mineEmptyBlocks
+
+`mineEmptyBlocks` mines multiple empty blocks.
+
+Usage:
+
+```
+mineEmptyBlocks(count?: number): number
+```
+
+```ts
+simnet.mineEmptyBlocks(5);
+const newHeight = simnet.blockHeight;
+// Returns: 6
+```
+
+## Utility methods
+
+### runSnippet
+
+`runSnippet` executes arbitrary Clarity code without deploying.
+
+Usage:
+
+```
+runSnippet(snippet: string): string | ClarityValue
+```
+
+```ts
+const result = simnet.runSnippet('(stx-account tx-sender)');
+// Returns account balance information
+```
+
+### getContractsInterfaces
+
+`getContractsInterfaces` returns contract interfaces with function signatures and storage.
+
+Usage:
+
+```
+getContractsInterfaces(): Map<string, ContractInterface>
+```
+
+```ts
+const interfaces = simnet.getContractsInterfaces();
+const poolInterface = interfaces.get(`${simnet.deployer}.pool`);
+// Returns contract interface with functions, maps, variables
+```
+
+### getContractSource
+
+`getContractSource` retrieves the source code of a deployed contract.
+
+Usage:
+
+```
+getContractSource(contract: string): string | undefined
+```
+
+```ts
+const source = simnet.getContractSource('pool');
+// Returns Clarity source code as string
+```
+
+### getContractAST
+
+`getContractAST` returns the Abstract Syntax Tree of a contract.
+
+Usage:
+
+```
+getContractAST(contractId: string): ContractAST
+```
+
+```ts
+const ast = simnet.getContractAST('pool');
+// Returns parsed AST structure
+```
+
+## Custom matchers
+
+The SDK provides Vitest matchers for Clarity value assertions.
+
+### Response matchers
+
+#### toBeOk
+
+Asserts that a response is `(ok <value>)`.
+
+```ts
+expect(result).toBeOk(Cl.uint(1));
+```
+
+#### toBeErr
+
+Asserts that a response is `(err <value>)`.
+
+```ts
+expect(result).toBeErr(Cl.uint(500));
+```
+
+#### toBeSome
+
+Asserts that a response is `(some <value>)`.
+
+```ts
+expect(result).toBeSome(Cl.bool(true));
+```
+
+#### toBeNone
+
+Asserts that a response is `(none)`.
+
+```ts
+expect(result).toBeNone();
+```
+
+### Value matchers
+
+#### toBeBool
+
+Asserts a boolean value.
+
+```ts
+expect(result).toBeBool(true);
+```
+
+#### toBeInt
+
+Asserts a signed integer value.
+
+```ts
+expect(result).toBeInt(1); // or 1n
+```
+
+#### toBeUint
+
+Asserts an unsigned integer value.
+
+```ts
+expect(result).toBeUint(1); // or 1n
+```
+
+#### toBeAscii
+
+Asserts a string-ascii value.
+
+```ts
+expect(result).toBeAscii('Hello World');
+```
+
+#### toBeUtf8
+
+Asserts a string-utf8 value.
+
+```ts
+expect(result).toBeUtf8('Hello World');
+```
+
+#### toBePrincipal
+
+Asserts a principal value.
+
+```ts
+expect(Cl.standardPrincipal(deployer)).toBePrincipal(deployer);
+```
+
+#### toBeBuff
+
+Asserts a buffer value.
+
+```ts
+const buffer = Uint8Array.from([1, 2, 3, 4]);
+expect(result).toBeBuff(buffer);
+```
+
+#### toBeList
+
+Asserts a list of Clarity values.
+
+```ts
+expect(result).toBeList([
+  Cl.standardPrincipal('ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM'),
+  Cl.standardPrincipal('ST1SJ3DTE5DN7X54YDH5D64R3BCB6A2AG2ZQ8YPD5')
+]);
+```
+
+#### toBeTuple
+
+Asserts a tuple value.
+
+```ts
+expect(result).toBeTuple({
+  enrollmentBlock: Cl.some(Cl.uint(1)),
+  contributionAmount: Cl.some(Cl.uint(19000000))
+});
+```
+
+### Type checking
+
+#### toHaveClarityType
+
+Checks that a value has the expected Clarity type.
+
+```ts
+expect(result).toHaveClarityType(ClarityType.ResponseOk);
+```
+
+### Event matchers
+
+#### toContainEqual
+
+Asserts that an events array contains a specific event. This is useful for checking transaction events.
+
+```ts
+// STX transfer event
+expect(events).toContainEqual({
+  event: "stx_transfer_event",
+  data: {
+    amount: "1000000",
+    memo: "",
+    recipient: "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM",
+    sender: "ST1SJ3DTE5DN7X54YDH5D64R3BCB6A2AG2ZQ8YPD5",
+  },
+});
+
+// Fungible token transfer event
+expect(events).toContainEqual({
+  event: "ft_transfer_event",
+  data: {
+    amount: "1000",
+    asset_identifier: "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.token::my-token",
+    recipient: recipientAddress,
+    sender: senderAddress,
+  },
+});
+
+// NFT transfer event
+expect(events).toContainEqual({
+  event: "nft_transfer_event",
+  data: {
+    asset_identifier: "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.nft::my-nft",
+    value: Cl.serialize(Cl.uint(1)),
+    recipient: newOwner,
+    sender: previousOwner,
+  },
+});
+
+// Print event
+expect(events).toContainEqual({
+  event: "print_event",
+  data: {
+    contract_id: `${deployer}.my-contract`,
+    value: Cl.serialize(Cl.tuple({ message: Cl.stringAscii("Hello") })),
+  },
+});
+
+// Check only specific properties with objectContaining
+expect(events).toContainEqual({
+  event: "stx_transfer_event",
+  data: expect.objectContaining({
+    sender: senderAddress,
+    recipient: recipientAddress,
+  }),
+});
+```
+
+
+-----------------------------------------------------------------
+
+# Browser SDK Reference
+
+The browser build of the Clarinet SDK lets you interact with simnet directly from web experiences, so you can run Clarity tests without standing up a Node.js server.
+
+## Installation
+
+{% code title="Install" %}
+
+```bash
+npm install @stacks/clarinet-sdk-browser
+```
+
+{% endcode %}
+
+## Usage
+
+The browser SDK implements the same API as the Node.js Clarinet SDK. All methods, properties, and custom matchers work identically.
+
+### Empty session
+
+{% code title="Empty session (TypeScript)" %}
+
+```ts
+import { initSimnet } from '@stacks/clarinet-sdk-browser';
+
+const simnet = await initSimnet();
+await simnet.initEmptySession();
+
+// Execute Clarity code directly
+const result = simnet.runSnippet("(+ 1 2)");
+console.log(result); // 3
+```
+
+{% endcode %}
+
+### With a Clarinet project
+
+For testing with an existing Clarinet project using a virtual file system:
+
+{% code title="Using a Clarinet project (TypeScript)" %}
+
+```ts
+import { initSimnet } from '@stacks/clarinet-sdk-browser';
+
+const simnet = await initSimnet();
+await simnet.initSession("/project", "Clarinet.toml");
+
+// Your contracts are now available
+const count = simnet.getDataVar('counter', 'count');
+```
+
+{% endcode %}
+
+{% hint style="info" %}
+Virtual file system
+
+Using a Clarinet project in the browser requires setting up a virtual file system. Documentation and examples for this advanced use case are coming soon.
+{% endhint %}
+
+## Common use cases
+
+### Interactive contract playground
+
+{% code title="Playground example (TypeScript)" %}
+
+```ts
+import { initSimnet } from '@stacks/clarinet-sdk-browser';
+import { Cl } from '@stacks/transactions';
+
+// Initialize simnet
+const simnet = await initSimnet();
+await simnet.initEmptySession();
+
+// Deploy a simple contract
+const sourceCode = `
+(define-data-var counter uint u0)
+
+(define-public (increment)
+  (ok (var-set counter (+ (var-get counter) u1))))
+
+(define-read-only (get-counter)
+  (ok (var-get counter)))
+`;
+
+simnet.deployContract('counter', sourceCode, null, simnet.deployer);
+
+// Interact with the contract
+simnet.callPublicFn('counter', 'increment', [], simnet.deployer);
+const count = simnet.callReadOnlyFn('counter', 'get-counter', [], simnet.deployer);
+console.log(count.result); // (ok u1)
+```
+
+{% endcode %}
+
+### Testing in browser-based IDEs
+
+{% code title="Browser test example (TypeScript + Vitest)" %}
+
+```ts
+import { initSimnet } from '@stacks/clarinet-sdk-browser';
+import { expect } from 'vitest';
+
+const simnet = await initSimnet();
+await simnet.initEmptySession();
+
+// Run tests directly in the browser
+test('counter increments correctly', () => {
+  simnet.deployContract('counter', counterCode, null, simnet.deployer);
+  
+  const result = simnet.callPublicFn('counter', 'increment', [], simnet.deployer);
+  expect(result.result).toBeOk(Cl.uint(1));
+  
+  const count = simnet.getDataVar('counter', 'counter');
+  expect(count).toBeUint(1);
+});
+```
+
+{% endcode %}
+
+## Browser compatibility
+
+The browser SDK works in all modern browsers that support:
+
+* ES2020+ JavaScript features
+* WebAssembly
+* Dynamic imports
+
+Tested browsers include:
+
+* Chrome/Edge 90+
+* Firefox 89+
+* Safari 15+
+
+
+--------------------------------------------
+
+
+# @stacks/network
+
+The `@stacks/network` package exports network configurations and helper functions for working with different Stacks networks.
+
+## Installation
+
+{% code title="Install" %}
+
+```bash
+npm install @stacks/network
+```
+
+{% endcode %}
+
+## Network constants
+
+### STACKS\_MAINNET
+
+`STACKS_MAINNET` provides the mainnet network configuration.
+
+{% code title="TypeScript" %}
+
+```ts
+import { STACKS_MAINNET } from '@stacks/network';
+
+console.log(STACKS_MAINNET);
+// {
+//   chainId: 1,
+//   transactionVersion: 0,
+//   peerNetworkId: 385875968,
+//   magicBytes: "X2",
+//   bootAddress: "SP000000000000000000002Q6VF78",
+//   addressVersion: {
+//     singleSig: 22,
+//     multiSig: 20,
+//   },
+//   client: {
+//     baseUrl: "https://api.mainnet.hiro.so",
+//   },
+// }
+```
+
+{% endcode %}
+
+### STACKS\_TESTNET
+
+`STACKS_TESTNET` provides the testnet network configuration.
+
+{% code title="TypeScript" %}
+
+```ts
+import { STACKS_TESTNET } from '@stacks/network';
+
+console.log(STACKS_TESTNET.chainId); // 2147483648
+```
+
+{% endcode %}
+
+### STACKS\_DEVNET / STACKS\_MOCKNET
+
+`STACKS_DEVNET` provides the devnet network configuration.
+
+{% code title="TypeScript" %}
+
+```ts
+import { STACKS_DEVNET, STACKS_MOCKNET } from '@stacks/network';
+
+// Use in transactions
+import { makeSTXTokenTransfer } from '@stacks/transactions';
+
+const tx = await makeSTXTokenTransfer({
+  network: STACKS_DEVNET, // or STACKS_MOCKNET
+  // ... other options
+});
+```
+
+{% endcode %}
+
+## networkFromName
+
+`networkFromName` returns a network configuration for a given name string.
+
+### Signature
+
+```ts
+function networkFromName(name: 'mainnet' | 'testnet' | 'devnet' | 'mocknet'): StacksNetwork
+```
+
+### Parameters
+
+| Name   | Type                                              | Required | Description  |
+| ------ | ------------------------------------------------- | -------- | ------------ |
+| `name` | `'mainnet' \| 'testnet' \| 'devnet' \| 'mocknet'` | Yes      | Network name |
+
+### Examples
+
+{% code title="TypeScript" %}
+
+```ts
+import { networkFromName } from '@stacks/network';
+
+const mainnet = networkFromName('mainnet'); // Same as STACKS_MAINNET
+const testnet = networkFromName('testnet'); // Same as STACKS_TESTNET
+const devnet = networkFromName('devnet');   // Same as STACKS_DEVNET
+const mocknet = networkFromName('mocknet'); // Same as STACKS_MOCKNET
+```
+
+{% endcode %}
+
+### Using with transactions
+
+{% code title="TypeScript" %}
+
+```ts
+import { networkFromName } from '@stacks/network';
+import { makeContractCall } from '@stacks/transactions';
+
+const network = networkFromName('testnet');
+
+const tx = await makeContractCall({
+  network,
+  contractAddress: 'ST2ZRX0K27GW0SP3GJCEMHD95TQGJMKB7G9Y0X1MH',
+  contractName: 'hello-world',
+  functionName: 'say-hi',
+  functionArgs: [],
+  senderKey: privateKey
+});
+```
+
+{% endcode %}
+
+## clientFromNetwork
+
+`clientFromNetwork` extracts the API client configuration from a network.
+
+### Signature
+
+```ts
+function clientFromNetwork(network: StacksNetwork): Required<ClientOpts>
+```
+
+### Parameters
+
+| Name      | Type            | Required | Description                  |
+| --------- | --------------- | -------- | ---------------------------- |
+| `network` | `StacksNetwork` | Yes      | Network configuration object |
+
+### Example
+
+{% code title="TypeScript" %}
+
+```ts
+import { clientFromNetwork, STACKS_MAINNET } from '@stacks/network';
+
+const client = clientFromNetwork(STACKS_MAINNET);
+console.log(client.baseUrl); // 'https://api.mainnet.hiro.so'
+
+// Use with custom fetch
+const customClient = {
+  ...client,
+  fetch: customFetchFunction
+};
+```
+
+{% endcode %}
+
+## Network configuration properties
+
+All network constants share these properties:
+
+| Property             | Type   | Description                           |
+| -------------------- | ------ | ------------------------------------- |
+| `chainId`            | number | Unique identifier for the network     |
+| `transactionVersion` | number | Transaction serialization version     |
+| `peerNetworkId`      | number | P2P network identifier                |
+| `magicBytes`         | string | Network magic bytes for serialization |
+| `bootAddress`        | string | Boot contract address                 |
+
+## Default values
+
+The package also exports default configuration values:
+
+{% code title="TypeScript" %}
+
+```ts
+import { DEFAULT_CHAIN_ID, DEFAULT_TRANSACTION_VERSION } from '@stacks/network';
+
+console.log(DEFAULT_CHAIN_ID); // 1
+console.log(DEFAULT_TRANSACTION_VERSION); // 0
+```
+
+{% endcode %}
+
+
+
+---------------------------------------------------------------------
+
+# @stacks/transactions
+
+The `@stacks/transactions` package provides comprehensive functionality for creating, signing, and broadcasting transactions on the Stacks blockchain, including STX transfers, contract deployments, and contract calls.
+
+## Installation
+
+```bash
+npm install @stacks/transactions
+```
+
+## Transaction functions
+
+### makeSTXTokenTransfer
+
+`makeSTXTokenTransfer` creates a signed STX token transfer transaction.
+
+Signature
+
+```ts
+function makeSTXTokenTransfer(options: SignedTokenTransferOptions): Promise<StacksTransaction>
+```
+
+Parameters
+
+| Name         | Type                      | Required | Description                    |
+| ------------ | ------------------------- | -------- | ------------------------------ |
+| `recipient`  | `string`                  | Yes      | Recipient STX address          |
+| `amount`     | `bigint`                  | Yes      | Amount to transfer in microSTX |
+| `senderKey`  | `string`                  | Yes      | Sender's private key           |
+| `network`    | `StacksNetwork \| string` | Yes      | Network configuration          |
+| `memo`       | `string`                  | No       | Optional memo field            |
+| `fee`        | `bigint`                  | No       | Transaction fee in microSTX    |
+| `nonce`      | `bigint`                  | No       | Account nonce                  |
+| `anchorMode` | `AnchorMode`              | No       | Block anchoring mode           |
+
+Examples
+
+Basic transfer
+
+```ts
+import { makeSTXTokenTransfer, broadcastTransaction } from '@stacks/transactions';
+
+const transaction = await makeSTXTokenTransfer({
+  recipient: 'SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159',
+  amount: 1000000n, // 1 STX in microSTX
+  senderKey: 'b244296d5907de9864c0b0d51f98a13c52890be0404e83f273144cd5b9960eed01',
+  network: 'mainnet'
+});
+
+const response = await broadcastTransaction({ transaction, network: 'mainnet' });
+console.log(response.txid);
+```
+
+Transfer with memo
+
+```ts
+const transaction = await makeSTXTokenTransfer({
+  recipient: 'SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159',
+  amount: 2500000n,
+  memo: 'Payment for services',
+  senderKey: privateKey,
+  network: 'testnet'
+});
+```
+
+### makeUnsignedSTXTokenTransfer
+
+`makeUnsignedSTXTokenTransfer` creates an unsigned STX token transfer transaction.
+
+Signature
+
+```ts
+function makeUnsignedSTXTokenTransfer(options: UnsignedTokenTransferOptions): Promise<StacksTransaction>
+```
+
+Parameters
+
+| Name        | Type                      | Required | Description                    |
+| ----------- | ------------------------- | -------- | ------------------------------ |
+| `recipient` | `string`                  | Yes      | Recipient STX address          |
+| `amount`    | `bigint`                  | Yes      | Amount to transfer in microSTX |
+| `publicKey` | `string`                  | Yes      | Sender's public key            |
+| `network`   | `StacksNetwork \| string` | Yes      | Network configuration          |
+| `memo`      | `string`                  | No       | Optional memo field            |
+| `fee`       | `bigint`                  | No       | Transaction fee in microSTX    |
+| `nonce`     | `bigint`                  | No       | Account nonce                  |
+
+Example
+
+```ts
+import { makeUnsignedSTXTokenTransfer } from '@stacks/transactions';
+
+const unsignedTx = await makeUnsignedSTXTokenTransfer({
+  recipient: 'SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159',
+  amount: 1000000n,
+  publicKey: publicKeyString,
+  network: 'mainnet'
+});
+```
+
+### makeContractDeploy
+
+`makeContractDeploy` creates a signed smart contract deployment transaction.
+
+Signature
+
+```ts
+function makeContractDeploy(options: SignedContractDeployOptions): Promise<StacksTransaction>
+```
+
+Parameters
+
+| Name             | Type                      | Required | Description                          |
+| ---------------- | ------------------------- | -------- | ------------------------------------ |
+| `contractName`   | `string`                  | Yes      | Name for the contract                |
+| `codeBody`       | `string`                  | Yes      | Clarity contract source code         |
+| `senderKey`      | `string`                  | Yes      | Deployer's private key               |
+| `network`        | `StacksNetwork \| string` | Yes      | Network configuration                |
+| `clarityVersion` | `ClarityVersion`          | No       | Clarity version (defaults to latest) |
+| `fee`            | `bigint`                  | No       | Transaction fee in microSTX          |
+| `nonce`          | `bigint`                  | No       | Account nonce                        |
+
+Examples
+
+Deploy a contract
+
+```ts
+import { makeContractDeploy, broadcastTransaction } from '@stacks/transactions';
+import { readFileSync } from 'fs';
+
+const codeBody = readFileSync('./contract.clar', 'utf-8');
+
+const transaction = await makeContractDeploy({
+  contractName: 'my-contract',
+  codeBody,
+  senderKey: privateKey,
+  network: 'testnet'
+});
+
+const response = await broadcastTransaction({ transaction, network: 'testnet' });
+```
+
+Deploy with Clarity version
+
+```ts
+const transaction = await makeContractDeploy({
+  contractName: 'clarity-v3-contract',
+  codeBody: contractCode,
+  clarityVersion: 3,
+  senderKey: privateKey,
+  network: 'mainnet'
+});
+```
+
+### makeContractCall
+
+`makeContractCall` creates a signed contract function call transaction.
+
+Signature
+
+```ts
+function makeContractCall(options: SignedContractCallOptions): Promise<StacksTransaction>
+```
+
+Parameters
+
+| Name              | Type                      | Required | Description                    |
+| ----------------- | ------------------------- | -------- | ------------------------------ |
+| `contractAddress` | `string`                  | Yes      | Contract address               |
+| `contractName`    | `string`                  | Yes      | Contract name                  |
+| `functionName`    | `string`                  | Yes      | Function to call               |
+| `functionArgs`    | `ClarityValue[]`          | Yes      | Function arguments             |
+| `senderKey`       | `string`                  | Yes      | Caller's private key           |
+| `network`         | `StacksNetwork \| string` | Yes      | Network configuration          |
+| `postConditions`  | `PostCondition[]`         | No       | Post conditions                |
+| `validateWithAbi` | `boolean \| ClarityAbi`   | No       | Validate arguments against ABI |
+| `fee`             | `bigint`                  | No       | Transaction fee in microSTX    |
+| `nonce`           | `bigint`                  | No       | Account nonce                  |
+
+Examples
+
+Basic contract call
+
+```ts
+import { makeContractCall, broadcastTransaction, Cl } from '@stacks/transactions';
+
+const transaction = await makeContractCall({
+  contractAddress: 'SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR',
+  contractName: 'hello-world',
+  functionName: 'say-hi',
+  functionArgs: [Cl.stringUtf8('Hello!')],
+  senderKey: privateKey,
+  network: 'testnet'
+});
+
+const response = await broadcastTransaction({ transaction, network: 'testnet' });
+```
+
+Call with post conditions
+
+```ts
+import { makeContractCall, Cl, Pc } from '@stacks/transactions';
+
+const postCondition = Pc.principal('SP2ZD731ANQZT6J4K3F5N8A40ZXWXC1XFXHVVQFKE')
+  .willSendLte(1000000n)
+  .ustx();
+
+const transaction = await makeContractCall({
+  contractAddress: 'SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR',
+  contractName: 'token-contract',
+  functionName: 'transfer',
+  functionArgs: [
+    Cl.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159'),
+    Cl.uint(100n)
+  ],
+  postConditions: [postCondition],
+  validateWithAbi: true,
+  senderKey: privateKey,
+  network: 'mainnet'
+});
+```
+
+### sponsorTransaction
+
+`sponsorTransaction` adds a sponsor signature to a transaction, enabling sponsored transactions.
+
+Signature
+
+```ts
+function sponsorTransaction(options: SponsorTransactionOptions): Promise<StacksTransaction>
+```
+
+Parameters
+
+| Name                | Type                | Required | Description               |
+| ------------------- | ------------------- | -------- | ------------------------- |
+| `transaction`       | `StacksTransaction` | Yes      | Transaction to sponsor    |
+| `sponsorPrivateKey` | `string`            | Yes      | Sponsor's private key     |
+| `fee`               | `bigint`            | Yes      | Fee to be paid by sponsor |
+| `sponsorNonce`      | `bigint`            | No       | Sponsor account nonce     |
+
+Example
+
+```ts
+import { sponsorTransaction, deserializeTransaction, broadcastTransaction } from '@stacks/transactions';
+
+// Deserialize the transaction from the origin
+const deserializedTx = deserializeTransaction(serializedTx);
+
+// Sponsor the transaction
+const sponsoredTx = await sponsorTransaction({
+  transaction: deserializedTx,
+  sponsorPrivateKey: sponsorKey,
+  fee: 1000n,
+  sponsorNonce: 0
+});
+
+const response = await broadcastTransaction({ transaction: sponsoredTx, network: 'testnet' });
+```
+
+### fetchCallReadOnlyFunction
+
+`fetchCallReadOnlyFunction` calls a read-only contract function without creating a transaction.
+
+Signature
+
+```ts
+function fetchCallReadOnlyFunction(options: CallReadOnlyFunctionOptions): Promise<ClarityValue>
+```
+
+Parameters
+
+| Name              | Type             | Required | Description           |
+| ----------------- | ---------------- | -------- | --------------------- |
+| `contractAddress` | `string`         | Yes      | Contract address      |
+| `contractName`    | `string`         | Yes      | Contract name         |
+| `functionName`    | `string`         | Yes      | Function to call      |
+| `functionArgs`    | `ClarityValue[]` | Yes      | Function arguments    |
+| `network`         | `StacksNetwork`  | Yes      | Network configuration |
+| `senderAddress`   | `string`         | Yes      | Address of the caller |
+
+Example
+
+```ts
+import { fetchCallReadOnlyFunction, Cl } from '@stacks/transactions';
+import { STACKS_MAINNET } from '@stacks/network';
+
+const result = await fetchCallReadOnlyFunction({
+  contractAddress: 'SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR',
+  contractName: 'data-store',
+  functionName: 'get-value',
+  functionArgs: [Cl.stringUtf8('key')],
+  network: STACKS_MAINNET,
+  senderAddress: 'SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159'
+});
+
+console.log(result);
+```
+
+### broadcastTransaction
+
+`broadcastTransaction` broadcasts a signed transaction to the network.
+
+Signature
+
+```ts
+function broadcastTransaction(options: BroadcastTransactionOptions): Promise<TxBroadcastResult>
+```
+
+Parameters
+
+| Name          | Type                      | Required | Description                     |
+| ------------- | ------------------------- | -------- | ------------------------------- |
+| `transaction` | `StacksTransaction`       | Yes      | Signed transaction to broadcast |
+| `network`     | `StacksNetwork \| string` | Yes      | Network to broadcast to         |
+
+Example
+
+```ts
+import { broadcastTransaction } from '@stacks/transactions';
+
+const result = await broadcastTransaction({
+  transaction: signedTx,
+  network: 'mainnet'
+});
+
+if (result.error) {
+  console.error('Broadcast failed:', result.reason);
+} else {
+  console.log('Transaction ID:', result.txid);
+}
+```
+
+## Clarity value construction
+
+### Primitive values
+
+```ts
+import { Cl } from '@stacks/transactions';
+
+// Boolean values
+const isTrue = Cl.bool(true);
+const isFalse = Cl.bool(false);
+
+// Integer values (signed 128-bit)
+const positiveInt = Cl.int(42n);
+const negativeInt = Cl.int(-100n);
+
+// Unsigned integer values (unsigned 128-bit)
+const unsignedInt = Cl.uint(100n);
+
+// Buffer values
+const buffer = Cl.bufferFromUtf8('hello world');
+const hexBuffer = Cl.bufferFromHex('0x1234');
+
+// String values
+const asciiStr = Cl.stringAscii('Hello ASCII');
+const utf8Str = Cl.stringUtf8('Hello UTF-8! 👋');
+```
+
+### Complex values
+
+```ts
+// Principal values
+const standardPrincipal = Cl.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159');
+const contractPrincipal = Cl.contractPrincipal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159', 'my-contract');
+
+// Optional values
+const none = Cl.none();
+const some = Cl.some(Cl.uint(42n));
+
+// Response values
+const okResponse = Cl.ok(Cl.stringUtf8('Success'));
+const errResponse = Cl.error(Cl.uint(404n));
+
+// Tuple values
+const tuple = Cl.tuple({
+  name: Cl.stringUtf8('Alice'),
+  age: Cl.uint(30n),
+  active: Cl.bool(true)
+});
+
+// List values
+const list = Cl.list([Cl.uint(1n), Cl.uint(2n), Cl.uint(3n)]);
+```
+
+## Post conditions
+
+### STX post conditions
+
+```ts
+import { Pc } from '@stacks/transactions';
+
+// Standard principal STX post condition
+const stxPostCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159')
+  .willSendGte(1000000n)
+  .ustx();
+
+// Contract principal STX post condition
+const contractStxCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159.my-contract')
+  .willSendEq(500000n)
+  .ustx();
+```
+
+### Fungible token post conditions
+
+```ts
+// Standard principal fungible token post condition
+const ftPostCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159')
+  .willSendLte(100n)
+  .ft('SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.token-contract', 'my-token');
+
+// Contract principal fungible token post condition
+const contractFtCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159.vault')
+  .willNotSend()
+  .ft('SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.token-contract', 'my-token');
+```
+
+### Non-fungible token post conditions
+
+```ts
+// Standard principal NFT post condition
+const nftPostCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159')
+  .willSend()
+  .nft('SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.nft-contract', 'my-nft', Cl.uint(1n));
+
+// Contract principal NFT post condition
+const contractNftCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159.marketplace')
+  .willNotSend()
+  .nft('SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.nft-contract', 'my-nft', Cl.uint(1n));
+```
+
+## Multi-signature transactions
+
+Multi-signature transactions require multiple signatures before broadcasting.
+
+{% stepper %}
+{% step %}
+
+### Create an unsigned multi-sig transaction
+
+```ts
+import {
+  makeUnsignedSTXTokenTransfer,
+} from '@stacks/transactions';
+
+const transaction = await makeUnsignedSTXTokenTransfer({
+  recipient: 'SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159',
+  amount: 1000000n,
+  fee: 200n,
+  numSignatures: 2, // Require 2 of 3 signatures
+  publicKeys: [publicKey1, publicKey2, publicKey3],
+  network: 'mainnet'
+});
+```
+
+{% endstep %}
+
+{% step %}
+
+### Deserialize and prepare signer
+
+```ts
+import {
+  deserializeTransaction,
+  TransactionSigner,
+} from '@stacks/transactions';
+
+const deserializedTx = deserializeTransaction(transaction.serialize());
+const signer = new TransactionSigner(deserializedTx);
+```
+
+{% endstep %}
+
+{% step %}
+
+### Add required signatures
+
+```ts
+// Add required signatures
+signer.signOrigin(privateKey1);
+signer.signOrigin(privateKey2);
+
+// Append public key of non-signing party
+signer.appendOrigin(publicKey3);
+```
+
+{% endstep %}
+
+{% step %}
+
+### Broadcast the multi-sig transaction
+
+```ts
+// Broadcast the multi-sig transaction
+const signedTx = deserializedTx;
+const response = await broadcastTransaction({ transaction: signedTx, network: 'mainnet' });
+```
+
+{% endstep %}
+{% endstepper %}
+
+## Key generation utilities
+
+### randomPrivateKey
+
+`randomPrivateKey` generates a new random private key.
+
+```ts
+import { randomPrivateKey } from '@stacks/transactions';
+
+const privateKey = randomPrivateKey();
+console.log(privateKey); // Random 32-byte hex string with optional compression flag
+```
+
+### privateKeyToPublicKey
+
+`privateKeyToPublicKey` derives a public key from a private key.
+
+```ts
+import { privateKeyToPublicKey } from '@stacks/transactions';
+
+const privateKey = 'b244296d5907de9864c0b0d51f98a13c52890be0404e83f273144cd5b9960eed01';
+const publicKey = privateKeyToPublicKey(privateKey);
+console.log(publicKey); // Compressed public key
+```
+
+## Utility functions
+
+### deserializeTransaction
+
+`deserializeTransaction` converts a serialized transaction back to a transaction object.
+
+```ts
+import { deserializeTransaction } from '@stacks/transactions';
+
+const serializedTx = '0x00000000...'; // Hex string
+const transaction = deserializeTransaction(serializedTx);
+```
+
+### cvToJSON
+
+`cvToJSON` converts Clarity values to JSON format for easier manipulation.
+
+```ts
+import { cvToJSON, hexToCV } from '@stacks/transactions';
+
+const clarityValue = hexToCV('0x0100000000000000000000000000000001');
+const json = cvToJSON(clarityValue);
+console.log(json); // { type: 'uint', value: '1' }
+```
+
+
+---------------------------------------------------------------------------------------------------------------
+
+
+# @stacks/transactions
+
+The `@stacks/transactions` package provides comprehensive functionality for creating, signing, and broadcasting transactions on the Stacks blockchain, including STX transfers, contract deployments, and contract calls.
+
+## Installation
+
+```bash
+npm install @stacks/transactions
+```
+
+## Transaction functions
+
+### makeSTXTokenTransfer
+
+`makeSTXTokenTransfer` creates a signed STX token transfer transaction.
+
+Signature
+
+```ts
+function makeSTXTokenTransfer(options: SignedTokenTransferOptions): Promise<StacksTransaction>
+```
+
+Parameters
+
+| Name         | Type                      | Required | Description                    |
+| ------------ | ------------------------- | -------- | ------------------------------ |
+| `recipient`  | `string`                  | Yes      | Recipient STX address          |
+| `amount`     | `bigint`                  | Yes      | Amount to transfer in microSTX |
+| `senderKey`  | `string`                  | Yes      | Sender's private key           |
+| `network`    | `StacksNetwork \| string` | Yes      | Network configuration          |
+| `memo`       | `string`                  | No       | Optional memo field            |
+| `fee`        | `bigint`                  | No       | Transaction fee in microSTX    |
+| `nonce`      | `bigint`                  | No       | Account nonce                  |
+| `anchorMode` | `AnchorMode`              | No       | Block anchoring mode           |
+
+Examples
+
+Basic transfer
+
+```ts
+import { makeSTXTokenTransfer, broadcastTransaction } from '@stacks/transactions';
+
+const transaction = await makeSTXTokenTransfer({
+  recipient: 'SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159',
+  amount: 1000000n, // 1 STX in microSTX
+  senderKey: 'b244296d5907de9864c0b0d51f98a13c52890be0404e83f273144cd5b9960eed01',
+  network: 'mainnet'
+});
+
+const response = await broadcastTransaction({ transaction, network: 'mainnet' });
+console.log(response.txid);
+```
+
+Transfer with memo
+
+```ts
+const transaction = await makeSTXTokenTransfer({
+  recipient: 'SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159',
+  amount: 2500000n,
+  memo: 'Payment for services',
+  senderKey: privateKey,
+  network: 'testnet'
+});
+```
+
+### makeUnsignedSTXTokenTransfer
+
+`makeUnsignedSTXTokenTransfer` creates an unsigned STX token transfer transaction.
+
+Signature
+
+```ts
+function makeUnsignedSTXTokenTransfer(options: UnsignedTokenTransferOptions): Promise<StacksTransaction>
+```
+
+Parameters
+
+| Name        | Type                      | Required | Description                    |
+| ----------- | ------------------------- | -------- | ------------------------------ |
+| `recipient` | `string`                  | Yes      | Recipient STX address          |
+| `amount`    | `bigint`                  | Yes      | Amount to transfer in microSTX |
+| `publicKey` | `string`                  | Yes      | Sender's public key            |
+| `network`   | `StacksNetwork \| string` | Yes      | Network configuration          |
+| `memo`      | `string`                  | No       | Optional memo field            |
+| `fee`       | `bigint`                  | No       | Transaction fee in microSTX    |
+| `nonce`     | `bigint`                  | No       | Account nonce                  |
+
+Example
+
+```ts
+import { makeUnsignedSTXTokenTransfer } from '@stacks/transactions';
+
+const unsignedTx = await makeUnsignedSTXTokenTransfer({
+  recipient: 'SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159',
+  amount: 1000000n,
+  publicKey: publicKeyString,
+  network: 'mainnet'
+});
+```
+
+### makeContractDeploy
+
+`makeContractDeploy` creates a signed smart contract deployment transaction.
+
+Signature
+
+```ts
+function makeContractDeploy(options: SignedContractDeployOptions): Promise<StacksTransaction>
+```
+
+Parameters
+
+| Name             | Type                      | Required | Description                          |
+| ---------------- | ------------------------- | -------- | ------------------------------------ |
+| `contractName`   | `string`                  | Yes      | Name for the contract                |
+| `codeBody`       | `string`                  | Yes      | Clarity contract source code         |
+| `senderKey`      | `string`                  | Yes      | Deployer's private key               |
+| `network`        | `StacksNetwork \| string` | Yes      | Network configuration                |
+| `clarityVersion` | `ClarityVersion`          | No       | Clarity version (defaults to latest) |
+| `fee`            | `bigint`                  | No       | Transaction fee in microSTX          |
+| `nonce`          | `bigint`                  | No       | Account nonce                        |
+
+Examples
+
+Deploy a contract
+
+```ts
+import { makeContractDeploy, broadcastTransaction } from '@stacks/transactions';
+import { readFileSync } from 'fs';
+
+const codeBody = readFileSync('./contract.clar', 'utf-8');
+
+const transaction = await makeContractDeploy({
+  contractName: 'my-contract',
+  codeBody,
+  senderKey: privateKey,
+  network: 'testnet'
+});
+
+const response = await broadcastTransaction({ transaction, network: 'testnet' });
+```
+
+Deploy with Clarity version
+
+```ts
+const transaction = await makeContractDeploy({
+  contractName: 'clarity-v3-contract',
+  codeBody: contractCode,
+  clarityVersion: 3,
+  senderKey: privateKey,
+  network: 'mainnet'
+});
+```
+
+### makeContractCall
+
+`makeContractCall` creates a signed contract function call transaction.
+
+Signature
+
+```ts
+function makeContractCall(options: SignedContractCallOptions): Promise<StacksTransaction>
+```
+
+Parameters
+
+| Name              | Type                      | Required | Description                    |
+| ----------------- | ------------------------- | -------- | ------------------------------ |
+| `contractAddress` | `string`                  | Yes      | Contract address               |
+| `contractName`    | `string`                  | Yes      | Contract name                  |
+| `functionName`    | `string`                  | Yes      | Function to call               |
+| `functionArgs`    | `ClarityValue[]`          | Yes      | Function arguments             |
+| `senderKey`       | `string`                  | Yes      | Caller's private key           |
+| `network`         | `StacksNetwork \| string` | Yes      | Network configuration          |
+| `postConditions`  | `PostCondition[]`         | No       | Post conditions                |
+| `validateWithAbi` | `boolean \| ClarityAbi`   | No       | Validate arguments against ABI |
+| `fee`             | `bigint`                  | No       | Transaction fee in microSTX    |
+| `nonce`           | `bigint`                  | No       | Account nonce                  |
+
+Examples
+
+Basic contract call
+
+```ts
+import { makeContractCall, broadcastTransaction, Cl } from '@stacks/transactions';
+
+const transaction = await makeContractCall({
+  contractAddress: 'SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR',
+  contractName: 'hello-world',
+  functionName: 'say-hi',
+  functionArgs: [Cl.stringUtf8('Hello!')],
+  senderKey: privateKey,
+  network: 'testnet'
+});
+
+const response = await broadcastTransaction({ transaction, network: 'testnet' });
+```
+
+Call with post conditions
+
+```ts
+import { makeContractCall, Cl, Pc } from '@stacks/transactions';
+
+const postCondition = Pc.principal('SP2ZD731ANQZT6J4K3F5N8A40ZXWXC1XFXHVVQFKE')
+  .willSendLte(1000000n)
+  .ustx();
+
+const transaction = await makeContractCall({
+  contractAddress: 'SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR',
+  contractName: 'token-contract',
+  functionName: 'transfer',
+  functionArgs: [
+    Cl.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159'),
+    Cl.uint(100n)
+  ],
+  postConditions: [postCondition],
+  validateWithAbi: true,
+  senderKey: privateKey,
+  network: 'mainnet'
+});
+```
+
+### sponsorTransaction
+
+`sponsorTransaction` adds a sponsor signature to a transaction, enabling sponsored transactions.
+
+Signature
+
+```ts
+function sponsorTransaction(options: SponsorTransactionOptions): Promise<StacksTransaction>
+```
+
+Parameters
+
+| Name                | Type                | Required | Description               |
+| ------------------- | ------------------- | -------- | ------------------------- |
+| `transaction`       | `StacksTransaction` | Yes      | Transaction to sponsor    |
+| `sponsorPrivateKey` | `string`            | Yes      | Sponsor's private key     |
+| `fee`               | `bigint`            | Yes      | Fee to be paid by sponsor |
+| `sponsorNonce`      | `bigint`            | No       | Sponsor account nonce     |
+
+Example
+
+```ts
+import { sponsorTransaction, deserializeTransaction, broadcastTransaction } from '@stacks/transactions';
+
+// Deserialize the transaction from the origin
+const deserializedTx = deserializeTransaction(serializedTx);
+
+// Sponsor the transaction
+const sponsoredTx = await sponsorTransaction({
+  transaction: deserializedTx,
+  sponsorPrivateKey: sponsorKey,
+  fee: 1000n,
+  sponsorNonce: 0
+});
+
+const response = await broadcastTransaction({ transaction: sponsoredTx, network: 'testnet' });
+```
+
+### fetchCallReadOnlyFunction
+
+`fetchCallReadOnlyFunction` calls a read-only contract function without creating a transaction.
+
+Signature
+
+```ts
+function fetchCallReadOnlyFunction(options: CallReadOnlyFunctionOptions): Promise<ClarityValue>
+```
+
+Parameters
+
+| Name              | Type             | Required | Description           |
+| ----------------- | ---------------- | -------- | --------------------- |
+| `contractAddress` | `string`         | Yes      | Contract address      |
+| `contractName`    | `string`         | Yes      | Contract name         |
+| `functionName`    | `string`         | Yes      | Function to call      |
+| `functionArgs`    | `ClarityValue[]` | Yes      | Function arguments    |
+| `network`         | `StacksNetwork`  | Yes      | Network configuration |
+| `senderAddress`   | `string`         | Yes      | Address of the caller |
+
+Example
+
+```ts
+import { fetchCallReadOnlyFunction, Cl } from '@stacks/transactions';
+import { STACKS_MAINNET } from '@stacks/network';
+
+const result = await fetchCallReadOnlyFunction({
+  contractAddress: 'SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR',
+  contractName: 'data-store',
+  functionName: 'get-value',
+  functionArgs: [Cl.stringUtf8('key')],
+  network: STACKS_MAINNET,
+  senderAddress: 'SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159'
+});
+
+console.log(result);
+```
+
+### broadcastTransaction
+
+`broadcastTransaction` broadcasts a signed transaction to the network.
+
+Signature
+
+```ts
+function broadcastTransaction(options: BroadcastTransactionOptions): Promise<TxBroadcastResult>
+```
+
+Parameters
+
+| Name          | Type                      | Required | Description                     |
+| ------------- | ------------------------- | -------- | ------------------------------- |
+| `transaction` | `StacksTransaction`       | Yes      | Signed transaction to broadcast |
+| `network`     | `StacksNetwork \| string` | Yes      | Network to broadcast to         |
+
+Example
+
+```ts
+import { broadcastTransaction } from '@stacks/transactions';
+
+const result = await broadcastTransaction({
+  transaction: signedTx,
+  network: 'mainnet'
+});
+
+if (result.error) {
+  console.error('Broadcast failed:', result.reason);
+} else {
+  console.log('Transaction ID:', result.txid);
+}
+```
+
+## Clarity value construction
+
+### Primitive values
+
+```ts
+import { Cl } from '@stacks/transactions';
+
+// Boolean values
+const isTrue = Cl.bool(true);
+const isFalse = Cl.bool(false);
+
+// Integer values (signed 128-bit)
+const positiveInt = Cl.int(42n);
+const negativeInt = Cl.int(-100n);
+
+// Unsigned integer values (unsigned 128-bit)
+const unsignedInt = Cl.uint(100n);
+
+// Buffer values
+const buffer = Cl.bufferFromUtf8('hello world');
+const hexBuffer = Cl.bufferFromHex('0x1234');
+
+// String values
+const asciiStr = Cl.stringAscii('Hello ASCII');
+const utf8Str = Cl.stringUtf8('Hello UTF-8! 👋');
+```
+
+### Complex values
+
+```ts
+// Principal values
+const standardPrincipal = Cl.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159');
+const contractPrincipal = Cl.contractPrincipal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159', 'my-contract');
+
+// Optional values
+const none = Cl.none();
+const some = Cl.some(Cl.uint(42n));
+
+// Response values
+const okResponse = Cl.ok(Cl.stringUtf8('Success'));
+const errResponse = Cl.error(Cl.uint(404n));
+
+// Tuple values
+const tuple = Cl.tuple({
+  name: Cl.stringUtf8('Alice'),
+  age: Cl.uint(30n),
+  active: Cl.bool(true)
+});
+
+// List values
+const list = Cl.list([Cl.uint(1n), Cl.uint(2n), Cl.uint(3n)]);
+```
+
+## Post conditions
+
+### STX post conditions
+
+```ts
+import { Pc } from '@stacks/transactions';
+
+// Standard principal STX post condition
+const stxPostCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159')
+  .willSendGte(1000000n)
+  .ustx();
+
+// Contract principal STX post condition
+const contractStxCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159.my-contract')
+  .willSendEq(500000n)
+  .ustx();
+```
+
+### Fungible token post conditions
+
+```ts
+// Standard principal fungible token post condition
+const ftPostCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159')
+  .willSendLte(100n)
+  .ft('SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.token-contract', 'my-token');
+
+// Contract principal fungible token post condition
+const contractFtCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159.vault')
+  .willNotSend()
+  .ft('SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.token-contract', 'my-token');
+```
+
+### Non-fungible token post conditions
+
+```ts
+// Standard principal NFT post condition
+const nftPostCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159')
+  .willSend()
+  .nft('SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.nft-contract', 'my-nft', Cl.uint(1n));
+
+// Contract principal NFT post condition
+const contractNftCondition = Pc.principal('SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159.marketplace')
+  .willNotSend()
+  .nft('SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.nft-contract', 'my-nft', Cl.uint(1n));
+```
+
+## Multi-signature transactions
+
+Multi-signature transactions require multiple signatures before broadcasting.
+
+{% stepper %}
+{% step %}
+
+### Create an unsigned multi-sig transaction
+
+```ts
+import {
+  makeUnsignedSTXTokenTransfer,
+} from '@stacks/transactions';
+
+const transaction = await makeUnsignedSTXTokenTransfer({
+  recipient: 'SP3FGQ8Z7JY9BWYZ5WM53E0M9NK7WHJF0691NZ159',
+  amount: 1000000n,
+  fee: 200n,
+  numSignatures: 2, // Require 2 of 3 signatures
+  publicKeys: [publicKey1, publicKey2, publicKey3],
+  network: 'mainnet'
+});
+```
+
+{% endstep %}
+
+{% step %}
+
+### Deserialize and prepare signer
+
+```ts
+import {
+  deserializeTransaction,
+  TransactionSigner,
+} from '@stacks/transactions';
+
+const deserializedTx = deserializeTransaction(transaction.serialize());
+const signer = new TransactionSigner(deserializedTx);
+```
+
+{% endstep %}
+
+{% step %}
+
+### Add required signatures
+
+```ts
+// Add required signatures
+signer.signOrigin(privateKey1);
+signer.signOrigin(privateKey2);
+
+// Append public key of non-signing party
+signer.appendOrigin(publicKey3);
+```
+
+{% endstep %}
+
+{% step %}
+
+### Broadcast the multi-sig transaction
+
+```ts
+// Broadcast the multi-sig transaction
+const signedTx = deserializedTx;
+const response = await broadcastTransaction({ transaction: signedTx, network: 'mainnet' });
+```
+
+{% endstep %}
+{% endstepper %}
+
+## Key generation utilities
+
+### randomPrivateKey
+
+`randomPrivateKey` generates a new random private key.
+
+```ts
+import { randomPrivateKey } from '@stacks/transactions';
+
+const privateKey = randomPrivateKey();
+console.log(privateKey); // Random 32-byte hex string with optional compression flag
+```
+
+### privateKeyToPublicKey
+
+`privateKeyToPublicKey` derives a public key from a private key.
+
+```ts
+import { privateKeyToPublicKey } from '@stacks/transactions';
+
+const privateKey = 'b244296d5907de9864c0b0d51f98a13c52890be0404e83f273144cd5b9960eed01';
+const publicKey = privateKeyToPublicKey(privateKey);
+console.log(publicKey); // Compressed public key
+```
+
+## Utility functions
+
+### deserializeTransaction
+
+`deserializeTransaction` converts a serialized transaction back to a transaction object.
+
+```ts
+import { deserializeTransaction } from '@stacks/transactions';
+
+const serializedTx = '0x00000000...'; // Hex string
+const transaction = deserializeTransaction(serializedTx);
+```
+
+### cvToJSON
+
+`cvToJSON` converts Clarity values to JSON format for easier manipulation.
+
+```ts
+import { cvToJSON, hexToCV } from '@stacks/transactions';
+
+const clarityValue = hexToCV('0x0100000000000000000000000000000001');
+const json = cvToJSON(clarityValue);
+console.log(json); // { type: 'uint', value: '1' }
+```
+
+---------------------------------------------------------------------------------------------------------------------
+
