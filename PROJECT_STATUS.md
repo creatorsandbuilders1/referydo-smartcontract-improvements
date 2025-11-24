@@ -1,9 +1,9 @@
 # 📊 REFERYDO Project Status & Development Log
 
-**Last Updated**: November 22, 2024  
+**Last Updated**: November 23, 2024  
 **Contract Version**: V8 (Gas Optimized)  
 **Test Coverage**: 100%  
-**Status**: ✅ Ready for Mainnet Deployment
+**Status**: ✅ Deployed to Testnet - Ready for Mainnet
 
 ---
 
@@ -37,6 +37,13 @@
    - Full cost report generated (`costs-reports.json`)
    - All functions within acceptable limits
    - Distribution function optimized
+
+5. **Testnet Deployment**
+   - **Contract Address**: `ST3WRT7YDT1A14EGMND7JA1W0AXV1H5P9TRT55ZJY.REFERYDO-project-escrow-v8`
+   - **Transaction ID**: `0xae7f3aa981fa6af793d5a7ccb868a0743376444bde8e7b096cabde83f4573771`
+   - **Deploy Fee**: 0.50 STX
+   - **Status**: Successfully deployed and verified
+   - **Explorer**: https://explorer.hiro.so/txid/0xae7f3aa981fa6af793d5a7ccb868a0743376444bde8e7b096cabde83f4573771?chain=testnet
 
 ---
 
@@ -324,9 +331,9 @@ clarinet deploy --testnet
 - [x] Contract optimized (V8)
 - [x] Unit tests passing (36/36)
 - [x] Fuzz tests passing (100 runs, 0 failures)
+- [x] Testnet deployment verified ✅ **COMPLETED Nov 23, 2024**
 - [ ] Invariant tests passing
 - [ ] Security audit completed
-- [ ] Testnet deployment verified
 - [ ] Frontend integration tested
 
 ### Deployment
@@ -344,5 +351,26 @@ clarinet deploy --testnet
 
 ---
 
-**Status**: 🟢 Ready for Invariant Testing → Security Audit → Mainnet
+**Status**: 🟢 Deployed to Testnet → Ready for Invariant Testing → Security Audit → Mainnet
+
+---
+
+## 🌐 Testnet Deployment Information
+
+**Deployment Date**: November 23, 2024
+
+**Contract Details**:
+- **Network**: Stacks Testnet
+- **Contract Name**: REFERYDO-project-escrow-v8
+- **Deployer Address**: ST3WRT7YDT1A14EGMND7JA1W0AXV1H5P9TRT55ZJY
+- **Contract Address**: ST3WRT7YDT1A14EGMND7JA1W0AXV1H5P9TRT55ZJY.REFERYDO-project-escrow-v8
+- **Transaction ID**: 0xae7f3aa981fa6af793d5a7ccb868a0743376444bde8e7b096cabde83f4573771
+- **Deploy Fee**: 0.50 STX
+- **Available Functions**: 13 public functions
+
+**Explorer Links**:
+- Transaction: https://explorer.hiro.so/txid/0xae7f3aa981fa6af793d5a7ccb868a0743376444bde8e7b096cabde83f4573771?chain=testnet
+- Contract: https://explorer.hiro.so/txid/ST3WRT7YDT1A14EGMND7JA1W0AXV1H5P9TRT55ZJY.REFERYDO-project-escrow-v8?chain=testnet
+
+**Verification Status**: ✅ Successfully deployed and verified on Stacks Explorer
 

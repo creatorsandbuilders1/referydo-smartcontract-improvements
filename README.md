@@ -1,306 +1,396 @@
-# REFERYDO! - Decentralized Talent Marketplace 
+# REFERYDO Smart Contract - Project Escrow V8
 
+> Decentralized escrow smart contract for the REFERYDO talent marketplace, built on Stacks blockchain with Clarity.
 
-> **Refer-You-Do**: The future of work powered by trust, transparency, and Stacks blockchain technology.
+[![Stacks](https://img.shields.io/badge/Stacks-Blockchain-5546FF)](https://www.stacks.co/)
+[![Clarity](https://img.shields.io/badge/Clarity-Smart%20Contract-00D4AA)](https://clarity-lang.org/)
+[![Tests](https://img.shields.io/badge/Tests-36%2F36%20Passing-success)](./tests)
+[![Fuzz](https://img.shields.io/badge/Fuzz%20Tests-100%20runs%2C%200%20bugs-success)](./contracts/referydo_advance.tests.clar)
+[![Deployed](https://img.shields.io/badge/Testnet-Deployed-blue)](https://explorer.hiro.so/txid/ST3WRT7YDT1A14EGMND7JA1W0AXV1H5P9TRT55ZJY.REFERYDO-project-escrow-v8?chain=testnet)
 
-![REFERYDO! Logo](https://odewvxxcqqqfpanvsaij.supabase.co/storage/v1/object/public/referydoplace/logoreferydo.png)
+---
 
-More About Referydo, check this notion: https://harmless-oatmeal-afb.notion.site/REFERYDO-299ba1a293e8807b9e73f210bc218d1b
+## 🎉 Development Status: ALL CRITERIA MET ✅
 
-## 🎯 What is REFERYDO!?
+| Criterion | Status | Details |
+|-----------|--------|---------|
+| ✅ Contract functionality & unit tests | **COMPLETED** | 36/36 tests passing (100% coverage) |
+| ✅ Fuzz testing with Rendezvous | **COMPLETED** | 100 runs, 0 bugs found |
+| ✅ Migrate to Clarinet | **COMPLETED** | Clarinet 3.8.1 configured |
+| ✅ Deploy to testnet | **COMPLETED** | Nov, 2025 |
 
-REFERYDO! is a revolutionary Web3 talent (Users who offer digital services) marketplace built on the Stacks blockchain that transforms how freelancers, scouts, and clients connect and collaborate. Unlike traditional platforms that extract value, REFERYDO! distributes it fairly among all participants through smart contracts and guaranteed commissions. 
+📄 **[View Complete Criteria Report →](CRITERIA_COMPLETION.md)**
 
-it gives everyone the opportunity to offer a service, be discovered by others, and allow other users get clients for you, all while guaranteeing their commissions—a place where incentives are aligned for everyone!
+---
 
-### The Problem We Solve
+## 📋 Table of Contents
 
-Traditional freelance platforms:
-- Charge predatory 20%+ fees
-- Own your reputation and reviews
-- Provide no incentive for referrals
-- Have delayed and disputed payments, Geographical limitations, payment systems that exclude some countries
-- Lock you into their ecosystem
+- [Overview](#overview)
+- [Contract Details](#contract-details)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Testing](#testing)
+- [Deployment](#deployment)
+- [Documentation](#documentation)
+- [About REFERYDO](#about-referydo)
 
-### Our Solution
+---
 
-REFERYDO! offers:
-- **Fair 7% ecosystem fee** - Transparent, community-driven pricing
-- **Sovereign on-chain reputation** - Your work history, owned by you forever- The proofs of your work are recorded in stacks on BTC.
-- **Guaranteed Scout commissions** - Every referral gets paid automatically to their wallets!
-- **Instant smart contract payouts** - When the work is done, the money is distributed instantly. No delays, only blockchain
-- **Three-way value creation** - Clients, Talent, and Scouts all win, Each user can operate in all 3 roles
+## 🎯 Overview
+
+This repository contains the **REFERYDO Project Escrow V8** smart contract, a gas-optimized Clarity contract that powers the escrow functionality for the REFERYDO decentralized talent marketplace.
+
+The contract enables trustless, atomic payments between three parties:
+- **Clients** who hire talent
+- **Talent** who complete work
+- **Scouts** who refer talent and earn commissions
+
+### What Makes This Contract Special
+
+- **100% Fund Distribution**: Mathematically verified to distribute all escrowed funds
+- **Gas Optimized**: 30-50% gas reduction vs previous version
+- **Atomic Payments**: All transfers succeed or fail together
+- **Guaranteed Commissions**: Scouts automatically receive their fees
+- **Flexible Fees**: Configurable scout and platform fee percentages
+- **Accept/Decline Flow**: Talent can accept or decline projects with automatic refunds
+
+---
+
+## 📜 Contract Details
+
+### Testnet Deployment
+
+| Property | Value |
+|----------|-------|
+| **Network** | Stacks Testnet |
+| **Contract Name** | REFERYDO-project-escrow-v8 |
+| **Contract Address** | `ST3WRT7YDT1A14EGMND7JA1W0AXV1H5P9TRT55ZJY.REFERYDO-project-escrow-v8` |
+| **Transaction ID** | `0xae7f3aa981fa6af793d5a7ccb868a0743376444bde8e7b096cabde83f4573771` |
+| **Deployment Date** | November, 2025 |
+| **Version** | V8 (Gas Optimized) |
+
+**Explorer Links**:
+- [View Contract](https://explorer.hiro.so/txid/ST3WRT7YDT1A14EGMND7JA1W0AXV1H5P9TRT55ZJY.REFERYDO-project-escrow-v8?chain=testnet)
+- [View Transaction](https://explorer.hiro.so/txid/0xae7f3aa981fa6af793d5a7ccb868a0743376444bde8e7b096cabde83f4573771?chain=testnet)
+
+### Contract Statistics
+
+- **Lines of Code**: ~400
+- **Public Functions**: 13
+- **Read-Only Functions**: 5
+- **Gas Efficiency**: All functions use < 0.01% of runtime limit
+- **Test Coverage**: 100%
+
+---
+
+## ✨ Features
+
+### Core Functionality
+
+#### 1. Project Creation
+```clarity
+(create-project talent scout amount scout-fee platform-fee)
+```
+- Initialize escrow with all participants
+- Set custom fee percentages (0-100%)
+- Validates fee bounds and combinations
+
+#### 2. Escrow Funding
+```clarity
+(fund-escrow project-id)
+```
+- Client deposits STX into contract
+- Funds locked until project completion or decline
+- Updates project status to "Pending Acceptance"
+
+#### 3. Project Acceptance/Decline
+```clarity
+(accept-project project-id)
+(decline-project project-id)
+```
+- Talent can accept to start work
+- Talent can decline with automatic client refund
+- Ensures talent consent before work begins
+
+#### 4. Atomic Distribution
+```clarity
+(approve-and-distribute project-id)
+```
+- Client approves completed work
+- Distributes 100% of escrowed funds atomically:
+  - Talent receives payment (minus fees)
+  - Scout receives commission
+  - Platform receives fee
+- All transfers succeed or fail together
+
+#### 5. Admin Functions
+```clarity
+(transfer-admin new-admin)
+(update-platform-wallet new-wallet)
+```
+- Super-admin role management
+- Platform wallet configuration
+- Secure governance controls
+
+### Project Status Flow
+
+```
+0: Created → 4: Pending_Acceptance → 1: Funded → 2: Completed
+                                   ↓
+                              5: Declined (with refund)
+```
 
 ---
 
 ## 🏗️ Architecture
 
-### Tech Stack
+### Gas Optimization (V8)
 
-**Frontend**:
-- React + TypeScript
-- Tailwind CSS + shadcn/ui
-- Vite
-- React Router
-- Tanstack Query
+The V8 version follows the official Stacks mainnet pattern (POX-4) for maximum efficiency:
 
-**Backend**:
-- Supabase (PostgreSQL + Edge Functions)
-- Real-time subscriptions
-- Row Level Security (RLS)
-
-**Blockchain**:
-- Stacks L2 (Bitcoin-secured)
-- Clarity smart contracts
-- Xverse & Leather wallet integration
-
-**Storage**:
-- Supabase Storage
-- IPFS-ready architecture
-
----
-
-## 🚀 Key Features
-
-### 1. Wallet-First Authentication
-- No emails, no passwords
-- Connect with Xverse or Leather wallet
-- Your wallet = Your identity
-
-### 2. Discovery Hub
-- Browse talent portfolios
-- Visual-first showcase
-- Skills-based filtering
-- Scout connection system
-
-### 3. Job Board
-- Post projects for free (off-chain)
-- Talent can apply directly
-- Scouts can recommend from their roster, This is free networking in its purest form!
-- Complete candidate review dashboard
-
-### 4. Smart Contract Escrow
-- Funds locked in transparent smart contract (on testnet right now)
-- Automatic distribution on completion:
-  - Talent receives payment
-  - Scout receives commission
-  - Platform receives fee
-- Dispute resolution via community jury
-
-### 5. Workspace
-- Unified command center for all activities
-- Job postings management (Clients)
-- Application tracking (Talent)
-- Recommendation tracking (Scouts)
-- Active contract management
-- Integrated messaging (coming soon)
-
-### 6. Scout Economy
-- Connect with talent you trust
-- Earn commissions on successful referrals
-- Build your reputation as a connector
-- Guaranteed payouts via smart contracts
-
----
-
-## 📊 User Roles 
-
-Each user can assume these 3 roles at the same time, it is not exclusive, a talent can be a client, a scout can be a talent, and so on, this is natural and allows pure networking:
-
-### 🎨 Talent
-- Create dynamic profile with portfolio
-- Set your own finder's fee (commission for scouts)
-- Get discovered by scouts
-- Apply to jobs
-- Receive proposals
-- Work with escrow protection
-
-### 🔍 Scout
-- Build your roster of trusted talent
-- Recommend talent for projects
-- Earn automatic commissions
-- Track recommendation success
-- Monetize your network
-
-### 💼 Client
-- Post projects for free
-- Review applications and recommendations
-- Hire with confidence
-- Pay via smart contract escrow
-- Approve work and release funds
-
----
-
-## 🔐 Smart Contract Features
-
-### Project Escrow Contract
-
-**Status Flow**:
-```
-0: Created → 1: Funded → 2: Completed
-                      ↓
-                  3: Disputed (Community Resolution)
+```clarity
+;; Single let block with all calculations
+(let (
+  ;; 1. Calculate all payouts
+  (scout-payout (/ (* total-amount scout-fee) u100))
+  (platform-payout (/ (* total-amount platform-fee) u100))
+  (talent-payout (- total-amount (+ scout-payout platform-payout)))
+  
+  ;; 2. Prepare recipients
+  (recipients (list
+    { to: talent, ustx: talent-payout }
+    { to: scout, ustx: scout-payout }
+    { to: platform, ustx: platform-payout }
+  ))
+)
+  ;; 3. Validate all conditions
+  (asserts! ...)
+  
+  ;; 4. Execute atomic multi-send
+  (fold check-err (map send-payment recipients) (ok true))
+)
 ```
 
-**Key Functions**:
-- `create-project`: Initialize project with participants
-- `fund-escrow`: Client locks funds in contract
-- `approve-and-distribute`: Automatic payment distribution
-- `submit-dispute`: Community-based resolution
+**Benefits**:
+- 30-50% gas reduction vs V7
+- Atomic multi-recipient transfers
+- Follows audited mainnet patterns
+- Minimal runtime and memory usage
 
-**Security**:
-- Immutable participant addresses
-- Atomic fund distribution
-- No single point of failure
-- Transparent on-chain history
+### Security Features
 
----
+- ✅ **Immutable Participants**: Addresses locked at project creation
+- ✅ **Atomic Transfers**: All payments succeed or fail together
+- ✅ **Fee Validation**: Prevents overflow and underflow
+- ✅ **Authorization Checks**: Role-based access control
+- ✅ **State Machine**: Enforces valid state transitions
+- ✅ **No Reentrancy**: Uses Clarity's built-in protections
 
-## 🎨 Design Philosophy
-
-### Visual Identity
-- **Bold Typography**: Black font-weight for impact
-- **Neon Professional**: Blue (#2563EB), Green (#4ADE80), Orange (#F97316)
-- **Floating Elements**: Dynamic, energetic UI
-- **Glassmorphism**: Modern, premium feel
-
-### UX Principles
-- **Wallet-First**: No traditional auth friction
-- **Visual Showcase**: Talent portfolios front and center
-- **Economic Transparency**: All fees clearly displayed
-- **Trust Signals**: Scout connections, on-chain reputation
 
 ---
 
-## 📁 Project Structure
+## 🧪 Testing
 
-```
-referydo/
-├── src/
-│   ├── components/        # Reusable UI components
-│   ├── contexts/          # React contexts (Wallet, Scout)
-│   ├── hooks/             # Custom React hooks
-│   ├── pages/             # Route pages
-│   ├── services/          # Business logic
-│   └── types/             # TypeScript definitions
-├── supabase/
-│   ├── functions/         # Edge Functions
-│   └── migrations/        # Database migrations
-├── contracts/             # Clarity smart contracts
-│   ├── referydo_advance.clar        # Main escrow contract (V8)
-│   └── referydo_advance.tests.clar  # Fuzz tests
-├── tests/                 # Test files
-│   └── referydo_advance.test.ts     # Unit tests (36 tests)
-├── docs/                  # Documentation
-├── PROJECT_STATUS.md      # 📊 Development status & progress
-├── fuzztesting.md         # Fuzz testing documentation
-└── public/                # Static assets
-```
+### Unit Tests (Vitest + Clarinet SDK)
 
----
-
-## 🧪 Testing & Quality Assurance
-
-### Current Status: ✅ Production Ready
-
-**Smart Contract Version**: V8 (Gas Optimized)  
-**Test Coverage**: 100%  
-**Fuzz Testing**: 100 runs, 0 failures
-
-### Test Suite
+**36 tests covering 100% of functionality**:
 
 ```bash
-# Run unit tests (36 tests)
 npm test
+```
 
-# Run fuzz tests (property-based)
+**Test Categories**:
+- ✅ Project creation (8 tests)
+- ✅ Escrow funding (4 tests)
+- ✅ Project acceptance (3 tests)
+- ✅ Project decline (2 tests)
+- ✅ Fund distribution (9 tests)
+- ✅ Admin functions (6 tests)
+- ✅ Read-only functions (2 tests)
+- ✅ Complete workflows (2 tests)
+
+### Fuzz Testing (Rendezvous)
+
+**Property-based testing with 100 iterations**:
+
+```bash
 npm run fuzz
+```
 
-# Run invariant tests
-npx @stacks/rendezvous . referydo_advance invariant
+**Properties Tested**:
+- Fee bounds validation
+- Fund conservation (100% distribution)
+- Rounding loss minimization
+- Arithmetic underflow prevention
+- Edge case handling
 
-# Generate gas cost reports
+**Results**: 100 runs, 0 bugs found ✅
+
+### Gas Cost Analysis
+
+```bash
 npm run costs
 ```
 
-### Quality Metrics
-
-- ✅ **36 unit tests** passing (100% coverage)
-- ✅ **100 fuzz test iterations** (0 bugs found)
-- ✅ **8 property tests** validated
-- ✅ **6 invariant tests** implemented
-- ✅ **Gas optimized** (30-50% reduction vs V7)
-- ✅ **Mathematical correctness** verified (100% fund distribution)
-
-**See `PROJECT_STATUS.md` for detailed development log**
+**Key Function Costs**:
+| Function | Runtime | Memory | Status |
+|----------|---------|--------|--------|
+| create-project | 23,179 | 247 | ✅ Excellent |
+| fund-escrow | 37,353 | 606 | ✅ Excellent |
+| accept-project | 29,126 | 230 | ✅ Excellent |
+| approve-and-distribute | 101,672 | 1,358 | ✅ Excellent |
+| decline-project | 41,082 | 606 | ✅ Excellent |
 
 ---
 
+## 🚀 Deployment
 
-### Supabase Edge Functions
+### Testnet Deployment
+
+The contract is currently deployed on Stacks Testnet. See [DEPLOYMENT.md](DEPLOYMENT.md) for integration guide.
+
+### Deploy Your Own
 
 ```bash
-# Deploy all functions
-supabase functions deploy create-project
-supabase functions deploy create-application
-supabase functions deploy create-recommendation
-supabase functions deploy accept-project
-supabase functions deploy submit-work
-# ... and more
+# Generate deployment plan
+clarinet deployments generate --testnet
+
+# Deploy to testnet (requires testnet STX)
+clarinet deployments apply --testnet
 ```
 
+**Get Testnet STX**: https://explorer.hiro.so/sandbox/faucet?chain=testnet
+
+### Integration Example
+
+```typescript
+import { openContractCall } from '@stacks/connect';
+
+const contractAddress = 'ST3WRT7YDT1A14EGMND7JA1W0AXV1H5P9TRT55ZJY';
+const contractName = 'REFERYDO-project-escrow-v8';
+
+// Create a project
+await openContractCall({
+  network: 'testnet',
+  contractAddress,
+  contractName,
+  functionName: 'create-project',
+  functionArgs: [
+    principalCV(talentAddress),
+    principalCV(scoutAddress),
+    uintCV(1000000), // 1 STX
+    uintCV(10),      // 10% scout fee
+    uintCV(7)        // 7% platform fee
+  ],
+});
+```
+
+---
 
 ## 📚 Documentation
 
-Comprehensive documentation is available in the `/docs` folder:
+### Core Documentation
 
-- Architecture guides
-- API documentation
-- Smart contract specs
-- Deployment guides
-- Feature implementation details
+- **[README.md](README.md)** - This file (contract overview)
+- **[PROJECT_STATUS.md](PROJECT_STATUS.md)** - Development status and technical details
+- **[DEPLOYMENT.md](DEPLOYMENT.md)** - Deployment info and integration guide
+- **[CRITERIA_COMPLETION.md](CRITERIA_COMPLETION.md)** - Proof of criteria completion
 
+### Testing Documentation
 
-### Key Innovations
+- **[fuzztesting.md](fuzztesting.md)** - Rendezvous fuzz testing guide
+- **[FUZZ_TESTING_PLAN.md](FUZZ_TESTING_PLAN.md)** - Property-based testing plan
+- **[unitTesting.md](unitTesting.md)** - Unit testing documentation
 
-1. **Three-Way Value Creation**: First platform to guarantee Scout commissions via smart contracts
-2. **Sovereign Reputation**: On-chain work history that users truly own
-3. **Hybrid Architecture**: Off-chain job board + on-chain contracts for optimal UX
-4. **Visual-First Discovery**: Talent showcase prioritizes portfolios over resumes
-5. **Complete Workflow**: End-to-end from discovery to payment in one platform
+### Platform Context
+
+- **[REFERYDO_PLATFORM_CONTEXT.md](REFERYDO_PLATFORM_CONTEXT.md)** - About the REFERYDO platform
 
 ---
 
-## 🔗 Links
+## 📁 Repository Structure
+
+```
+referydo-smartcontract-improvements/
+├── contracts/
+│   ├── referydo_advance.clar        # Main escrow contract (V8)
+│   └── referydo_advance.tests.clar  # Fuzz tests
+├── tests/
+│   └── referydo_advance.test.ts     # Unit tests (36 tests)
+├── settings/
+│   └── Devnet.toml                  # Devnet configuration
+├── deployments/
+│   └── default.simnet-plan.yaml     # Deployment plan
+├── Clarinet.toml                    # Clarinet configuration
+├── package.json                     # NPM dependencies
+├── vitest.config.js                 # Test configuration
+├── README.md                        # This file
+├── PROJECT_STATUS.md                # Development log
+├── DEPLOYMENT.md                    # Deployment guide
+├── CRITERIA_COMPLETION.md           # Criteria report
+└── REFERYDO_PLATFORM_CONTEXT.md     # Platform overview
+```
+
+---
+
+## 🌟 About REFERYDO
+
+This smart contract powers the escrow functionality for **REFERYDO**, a decentralized talent marketplace built on Stacks blockchain.
+
+### Platform Features
+
+- **Three-Way Value Creation**: Clients, Talent, and Scouts all benefit
+- **Guaranteed Commissions**: Scouts automatically receive referral fees
+- **Sovereign Reputation**: On-chain work history owned by users
+- **Fair Fees**: 7% platform fee vs 20%+ on traditional platforms
+- **Instant Payouts**: Blockchain-powered automatic distribution
+
+**Learn More**: [REFERYDO_PLATFORM_CONTEXT.md](REFERYDO_PLATFORM_CONTEXT.md)
+
+### Platform Links
 
 - **Live Demo**: https://www.referydo.xyz/
-- **Smart Contracts**: 
-
-https://explorer.hiro.so/txid/ST2ZG3R1EMK0Z83EX4N43HATRFM68JMS01TNGZRPV.profile-registry?chain=testnet
-
-iterations:
-
-https://explorer.hiro.so/txid/0x0a82b710f47355688b163d2bfc3f62036ec36e112a6bdf1dd7f690509801c57e?chain=testnet
-
-https://explorer.hiro.so/txid/0x16450f621874d88ef5ff73421c9bb1d8544005ceab46ebafaafe223584951269?chain=testnet
-
-https://explorer.hiro.so/txid/0x7edce46fe54244a0c231cd0d0da0086fd34c2f0b0f4b00ea654fd3711d518c19?chain=testnet
-
-https://explorer.hiro.so/txid/0x0fedd279dd252b479653c08bc945feca2082d87981589b90d35e916f503f2a8e?chain=testnet
-
-https://explorer.hiro.so/address/ST2ZG3R1EMK0Z83EX4N43HATRFM68JMS01TNGZRPV?chain=testnet
-
+- **Documentation**: https://harmless-oatmeal-afb.notion.site/REFERYDO-299ba1a293e8807b9e73f210bc218d1b
 
 ---
 
-## 💡 Vision
+## 🤝 Contributing
 
-REFERYDO! is building the future of work where:
-- Your network is your net worth
-- Trust is programmable
-- Reputation is YOURS!
-- Everyone gets paid fairly
-- Blockchain enables, not complicates
+This is a production smart contract. For security reasons, contributions require thorough review.
+
+### Development Workflow
+
+1. Fork the repository
+2. Create a feature branch
+3. Write tests for new functionality
+4. Ensure all tests pass (`npm test`)
+5. Run fuzz tests (`npm run fuzz`)
+6. Submit a pull request
+
 ---
 
+## 📄 License
 
+See LICENSE file for details.
+
+---
+
+## 🔗 Resources
+
+### Stacks & Clarity
+
+- [Stacks Documentation](https://docs.stacks.co/)
+- [Clarity Language Book](https://book.clarity-lang.org/)
+- [Stacks Explorer](https://explorer.hiro.so/)
+
+### Tools
+
+- [Clarinet](https://github.com/hirosystems/clarinet)
+- [Rendezvous (Fuzz Testing)](https://github.com/stacks-network/rendezvous)
+- [Stacks.js](https://github.com/hirosystems/stacks.js)
+
+---
+
+**Contract Status**: ✅ Deployed to Testnet | Ready for Production Testing  
+**Last Updated**: November, 2025  
+**Version**: V8 (Gas Optimized)
