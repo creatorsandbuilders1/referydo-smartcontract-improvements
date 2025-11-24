@@ -296,6 +296,14 @@ await openContractCall({
 - **[DEPLOYMENT.md](DEPLOYMENT.md)** - Deployment info and integration guide
 - **[CRITERIA_COMPLETION.md](CRITERIA_COMPLETION.md)** - Proof of criteria completion
 
+### AI Integration Guides 🤖
+
+- **[QUICK_AI_BRIEFING.md](QUICK_AI_BRIEFING.md)** - Quick briefing for AI assistants (5 min read)
+- **[AI_INTEGRATION_PROMPT.md](AI_INTEGRATION_PROMPT.md)** - Comprehensive integration guide (15 min read)
+- **[AI_BRIEFING_README.md](AI_BRIEFING_README.md)** - How to use the AI briefing documents
+
+**Use these to brief AI assistants** helping with frontend integration or migration from old contract versions.
+
 ### Testing Documentation
 
 - **[fuzztesting.md](fuzztesting.md)** - Rendezvous fuzz testing guide
